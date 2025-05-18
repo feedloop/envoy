@@ -206,6 +206,45 @@ See the "Working with the State Context (`ctx`)" section above for usage example
 
 ---
 
+## Creating and Using Plugins (e.g., Logger Plugin)
+
+Plugins allow you to extend or intercept state transitions, routing, and more. For example, you can create a logger plugin to log every state transition:
+
+```ts
+import { StateMachinePlugin, StateContext } from './src/core/types';
+
+const loggerPlugin: StateMachinePlugin = {
+  name: 'logger',
+  onEnter: async (ctx: StateContext) => {
+    console.log(`[Logger] Entering state: ${ctx.state()} (step ${ctx.step()})`);
+    return ctx;
+  },
+  onExit: async (ctx: StateContext) => {
+    console.log(`[Logger] Exiting state: ${ctx.state()} (step ${ctx.step()})`);
+    return ctx;
+  },
+  onRoute: async (ctx: StateContext, proposedNext) => {
+    if (proposedNext) {
+      console.log(`[Logger] Routing from ${ctx.state()} to ${proposedNext.state}`);
+    }
+    return proposedNext;
+  }
+};
+```
+
+To use a plugin, add it to the `plugins` option when creating your state machine:
+
+```ts
+const sm = new StateMachine(states, {
+  startState: 'Start',
+  plugins: [loggerPlugin]
+});
+```
+
+Now, every state transition and routing decision will be logged to the console.
+
+---
+
 ## Example: ToolAgent Flow
 
 1. **Start**: Receives a user task, builds a prompt for the LLM.

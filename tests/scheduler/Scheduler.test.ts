@@ -257,4 +257,135 @@ describe('Scheduler (integration)', () => {
     const job = await scheduler.getJob(jobIdStr);
     expect(['done', 'failed', 'cancelled', 'running', 'pending']).toContain(job.status);
   });
+});
+
+describe('Scheduler blocking jobs', () => {
+  let pool: Pool;
+  let repo: PostgresJobRepo;
+  let redis: Redis;
+  let scheduler: Scheduler;
+
+  // Use the same dbConfig as above
+  const dbConfig = {
+    host: process.env.PGHOST!,
+    port: Number(process.env.PGPORT!),
+    user: process.env.PGUSER!,
+    password: process.env.PGPASSWORD!,
+    database: process.env.PGTESTDATABASE!,
+    adminDatabase: process.env.PGADMINDATABASE || process.env.PGDATABASE!,
+  };
+
+  // State machine that always waits for 'wait1'
+  const blockingStateMachine = new StateMachine([
+    {
+      name: 'start',
+      onState: async ctx => {
+        ctx.waitFor([{ id: 'wait1', type: 'external' }]);
+        return ctx;
+      },
+      router: { next: 'done' }
+    },
+    { name: 'done', onState: async ctx => ctx }
+  ]);
+
+  // State machine that waits for two IDs
+  const multiWaitStateMachine = new StateMachine([
+    {
+      name: 'start',
+      onState: async ctx => {
+        ctx.waitFor([
+          { id: 'wait1', type: 'external' },
+          { id: 'wait2', type: 'external' }
+        ]);
+        return ctx;
+      },
+      router: { next: 'done' }
+    },
+    { name: 'done', onState: async ctx => ctx }
+  ]);
+
+  beforeAll(async () => {
+    pool = new Pool(dbConfig);
+    repo = new PostgresJobRepo(pool);
+    redis = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number(process.env.REDIS_PORT) || 6379,
+      password: process.env.REDIS_PASSWORD || undefined,
+      db: 0,
+    });
+    scheduler = new Scheduler(repo, redis);
+    scheduler.addStateMachine('blocking', blockingStateMachine);
+    scheduler.addStateMachine('multiwait', multiWaitStateMachine);
+  });
+
+  afterAll(async () => {
+    if (scheduler && typeof scheduler.stopExecutionLoop === 'function') {
+      scheduler.stopExecutionLoop();
+    }
+    if (repo && typeof repo.close === 'function') {
+      await repo.close();
+    }
+    await redis.quit();
+  });
+
+  afterEach(async () => {
+    await pool.query('TRUNCATE TABLE jobs');
+    await redis.flushdb();
+  });
+
+  it('moves job to blocking queue and sets status', async () => {
+    const jobId = await scheduler.schedule('blocking', { foo: 'bar' });
+    await scheduler.runPendingJobs();
+    // Should be in blocking_jobs queue
+    const blockingQueue = await redis.lrange('blocking_jobs', 0, -1);
+    expect(blockingQueue).toContain(jobId);
+    // Should not be in job_queue
+    const mainQueue = await redis.lrange('job_queue', 0, -1);
+    expect(mainQueue).not.toContain(jobId);
+    // Status should be 'blocking'
+    const job = await scheduler.getJob(jobId as string);
+    expect(job.status).toBe('blocking');
+  });
+
+  it('listBlockingJobs returns correct jobs', async () => {
+    const jobId = await scheduler.schedule('blocking', { foo: 'bar' });
+    await scheduler.runPendingJobs();
+    const blockingJobs = await scheduler.listBlockingJobs();
+    expect(blockingJobs.length).toBe(1);
+    expect(blockingJobs[0].job.id).toBe(jobId);
+    expect(blockingJobs[0].blocking).toContain('wait1');
+  });
+
+  it('resolveBlockingJob moves job back to main queue if unblocked', async () => {
+    const jobId = await scheduler.schedule('blocking', { foo: 'bar' });
+    await scheduler.runPendingJobs();
+    await scheduler.resolveBlockingJob(jobId as string, 'wait1', { result: 42 });
+    // Should be removed from blocking_jobs
+    const blockingQueue = await redis.lrange('blocking_jobs', 0, -1);
+    expect(blockingQueue).not.toContain(jobId);
+    // Should be in job_queue
+    const mainQueue = await redis.lrange('job_queue', 0, -1);
+    expect(mainQueue).toContain(jobId);
+    // Status should be 'pending'
+    const job = await scheduler.getJob(jobId as string);
+    expect(job.status).toBe('pending');
+  });
+
+  it('resolveBlockingJob keeps job blocking if still waiting for other IDs', async () => {
+    const jobId = await scheduler.schedule('multiwait', { foo: 'bar' });
+    await scheduler.runPendingJobs();
+    // Resolve only one wait
+    await scheduler.resolveBlockingJob(jobId as string, 'wait1', { result: 1 });
+    // Should still be in blocking_jobs
+    const blockingQueue = await redis.lrange('blocking_jobs', 0, -1);
+    expect(blockingQueue).toContain(jobId);
+    // Status should be 'blocking'
+    const job = await scheduler.getJob(jobId as string);
+    expect(job.status).toBe('blocking');
+    // listBlockingJobs should show only wait2 as unresolved
+    const blockingJobs = await scheduler.listBlockingJobs();
+    expect(blockingJobs.length).toBe(1);
+    expect(blockingJobs[0].blocking).toContain('wait2');
+    expect(blockingJobs[0].blocking).not.toContain('wait1');
+  });
 }); 

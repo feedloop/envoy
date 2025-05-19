@@ -48,6 +48,22 @@ export class Scheduler {
     }
 
     /**
+     * Internal helper to handle moving a job to the blocking queue and updating status.
+     */
+    private async _handleBlockingJob(jobId: string, jobData: any, ctx: StateObject, queueNames: string[] = []) {
+        jobData.status = 'blocking';
+        jobData.context = ctx.serialize();
+        await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
+        // Remove from any provided queues
+        for (const queue of queueNames) {
+            await this._redis.lrem(queue, 0, jobId);
+        }
+        // Add to blocking_jobs queue if not already present
+        const inBlocking = (await this._redis.lrange('blocking_jobs', 0, -1)).includes(jobId);
+        if (!inBlocking) await this._redis.rpush('blocking_jobs', jobId);
+    }
+
+    /**
      * Polls for pending jobs, marks them as running, assigns workerId, and replicates to Redis.
      * @param limit Max number of jobs to process at once (default 10)
      */
@@ -73,7 +89,13 @@ export class Scheduler {
             try {
                 const sm = this.stateMachine(runningJob.stateMachine);
                 let ctx = StateObject.from(runningJob.context as SerializedState);
-                await sm.step(ctx); // If this throws, catch below
+                ctx = await sm.step(ctx) as StateObject; // If this throws, catch below
+                // Handle blocking jobs
+                if (ctx.isWaitingFor && ctx.isWaitingFor().length > 0) {
+                    const jobStr = await this._redis.get(`job:${job.id}`);
+                    let jobData = jobStr ? JSON.parse(jobStr) : { ...runningJob };
+                    await this._handleBlockingJob(job.id, jobData, ctx, ['job_queue']);
+                }
             } catch (err) {
                 await this.failJob(job.id, err instanceof Error ? err.message : String(err));
             }
@@ -207,6 +229,8 @@ export class Scheduler {
                     await this.completeJob(jobId);
                 } else if (newCtx.error) {
                     await this.failJob(jobId, newCtx.error);
+                } else if (newCtx.isWaitingFor && newCtx.isWaitingFor().length > 0) {
+                    await this._handleBlockingJob(jobId, jobData, newCtx as StateObject, [workerQueue, 'job_queue']);
                 } else {
                     await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
                     // Requeue job for next step
@@ -253,5 +277,58 @@ export class Scheduler {
         if (this._executionLoopTimer) {
             clearTimeout(this._executionLoopTimer);
         }
+    }
+
+    /**
+     * List all jobs currently in the blocking_jobs queue, with their waitFor info.
+     */
+    public async listBlockingJobs(): Promise<{ job: JobSchema, blocking: string[] }[]> {
+        const blockingJobIds = await this._redis.lrange('blocking_jobs', 0, -1);
+        const jobs: { job: JobSchema, blocking: string[] }[] = [];
+        for (const jobId of blockingJobIds) {
+            const job = await this.getJob(jobId);
+            const ctx = StateObject.from(job.context as SerializedState);
+            const blocking = ctx.isWaitingFor();
+            if (blocking.length > 0) {
+                jobs.push({ job, blocking });
+            }
+        }
+        return jobs;
+    }
+
+    /**
+     * Resolve a specific waitFor on a blocking job. If no more waits, move back to main queue and set status to 'pending'.
+     * Updates Redis immediately, Postgres asynchronously.
+     */
+    public async resolveBlockingJob(jobId: string, waitForId: string, output?: Json): Promise<void> {
+        const job = await this.getJob(jobId);
+        const ctx = StateObject.from(job.context as SerializedState);
+        ctx.resolve(waitForId, 'success', output);
+        const stillBlocking = ctx.isWaitingFor().length > 0;
+        // Update context and status in Redis
+        const jobStr = await this._redis.get(`job:${jobId}`);
+        let jobData = jobStr ? JSON.parse(jobStr) : { ...job };
+        jobData.context = ctx.serialize();
+        if (stillBlocking) {
+            jobData.status = 'blocking';
+            await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
+            // Ensure in blocking_jobs queue
+            const inQueue = (await this._redis.lrange('blocking_jobs', 0, -1)).includes(jobId);
+            if (!inQueue) await this._redis.rpush('blocking_jobs', jobId);
+        } else {
+            jobData.status = 'pending';
+            await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
+            // Remove from blocking_jobs queue
+            await this._redis.lrem('blocking_jobs', 0, jobId);
+            // Add back to main job queue
+            await this._redis.rpush('job_queue', jobId);
+        }
+        // Async update to Postgres
+        setTimeout(() => {
+            this._jobRepo.updateJob(jobId, {
+                context: jobData.context,
+                status: jobData.status,
+            }).catch(() => {});
+        }, 0);
     }
 }

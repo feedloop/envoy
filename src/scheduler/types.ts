@@ -1,7 +1,7 @@
 import { SerializedState, StateContext } from "../core/types";
 import { Json } from "../types";
 
-export type JobStatus = "pending" | "running" | "done" | "failed" | "cancelled";
+export type JobStatus = "pending" | "running" | "done" | "failed" | "cancelled" | "blocking";
 
 export interface JobSchema {
     id: string;

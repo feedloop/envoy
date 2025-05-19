@@ -1,10 +1,10 @@
 import { StateMachine } from "../core/StateMachine";
-import { JobRepo, JobSchema } from "./types";
+import { JobRepo, JobSchema, EscalationRepo, EscalationStatus, EscalationReply, JobStatus } from "./types";
 import { Json } from "../types";
 import { Redis } from "ioredis";
 import { v4 as uuidv4 } from 'uuid';
 import { StateObject } from "../core/StateObject";
-import { SerializedState } from "../core/types";
+import { EscalationInput, SerializedState } from "../core/types";
 
 interface SchedulerOptions {
     concurrency?: number;
@@ -19,11 +19,18 @@ export class Scheduler {
     private _executionLoopActive: boolean = false;
     private _cleanupTimer?: NodeJS.Timeout;
     private _maxRetries: number;
+    private _escalationRepo?: EscalationRepo;
 
-    constructor(private _jobRepo: JobRepo, private _redis: Redis, options: SchedulerOptions = {}) {
+    constructor(
+        private _jobRepo: JobRepo,
+        private _redis: Redis,
+        options: SchedulerOptions = {},
+        escalationRepo?: EscalationRepo
+    ) {
         this._workerId = uuidv4();
         this._concurrency = options.concurrency ?? 4;
         this._maxRetries = options.maxRetries ?? 3;
+        this._escalationRepo = escalationRepo;
     }
 
     public stateMachine(name: string): StateMachine {
@@ -112,6 +119,27 @@ export class Scheduler {
                         wait.childJobId = childJob.id;
                     }
                 }
+                // --- NEW: Handle escalate waits ---
+                if (this._escalationRepo) {
+                    for (const waitId of ctx.isWaitingFor()) {
+                        const wait = waitingMap[waitId];
+                        if (wait.type === 'escalate' && wait.status === 'pending' && wait.params) {
+                            // Check if escalation already exists for this job+waitId
+                            const existing = await this._escalationRepo.listPendingEscalations();
+                            const alreadyExists = existing.some(e => e.job_id === job.id && e.wait_id === waitId);
+                            if (!alreadyExists) {
+                                await this._escalationRepo.createEscalation({
+                                    job_id: job.id,
+                                    wait_id: waitId,
+                                    user: wait.params.user as string,
+                                    message: wait.params.message as string,
+                                    inputs: wait.params.inputs as EscalationInput[]
+                                });
+                            }
+                        }
+                    }
+                }
+                // --- END NEW ---
                 // Save updated context if any child jobs were created
                 await this._jobRepo.updateJob(job.id, { context: ctx.serialize() });
                 // Handle blocking jobs
@@ -454,6 +482,48 @@ export class Scheduler {
         if (this._cleanupTimer) {
             clearInterval(this._cleanupTimer);
             this._cleanupTimer = undefined;
+        }
+    }
+
+    /**
+     * Approve or reject an escalation and resolve it in the job context.
+     */
+    public async replyToEscalation(escalationId: string, values: EscalationReply, status: 'approved' | 'rejected'): Promise<void> {
+        if (!this._escalationRepo) throw new Error('No escalation repo configured');
+        // 1. Update escalation status and response
+        const escalation = await this._escalationRepo.updateEscalation(escalationId, {
+            status,
+            response: values,
+        });
+        // 2. Get the job and context
+        const job = await this._jobRepo.getJob(escalation.job_id);
+        const ctx = StateObject.from(job.context as SerializedState);
+        // 3. Resolve the escalation in the waiting map using wait_id
+        ctx.resolve(escalation.wait_id, status === 'approved' ? 'success' : 'error', values);
+        // 4. Save updated context and update job status accordingly
+        const stillBlocking = ctx.isWaitingFor().length > 0;
+        let newStatus: JobStatus;
+        if (stillBlocking) {
+            newStatus = 'blocking';
+        } else {
+            newStatus = 'pending';
+        }
+        // Update in Postgres
+        await this._jobRepo.updateJob(job.id, { context: ctx.serialize(), status: newStatus });
+        // Update in Redis
+        const jobStr = await this._redis.get(`job:${job.id}`);
+        let jobData = jobStr ? JSON.parse(jobStr) : { ...job };
+        jobData.context = ctx.serialize();
+        jobData.status = newStatus;
+        await this._redis.set(`job:${job.id}`, JSON.stringify(jobData));
+        if (stillBlocking) {
+            // Ensure in blocking_jobs queue
+            const inQueue = (await this._redis.lrange('blocking_jobs', 0, -1)).includes(job.id);
+            if (!inQueue) await this._redis.rpush('blocking_jobs', job.id);
+        } else {
+            // Remove from blocking_jobs queue and add to main job queue
+            await this._redis.lrem('blocking_jobs', 0, job.id);
+            await this._redis.rpush('job_queue', job.id);
         }
     }
 }

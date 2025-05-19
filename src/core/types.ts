@@ -80,6 +80,8 @@ export type StateContext = {
     output<T extends Json>(path: string, value: T): void;
     waitFor(waitlist: WaitFor[]): void;
     isWaitingFor(): string[];
+    spawn(sm: string, input: Json): string;
+    escalate(user: string, message: string, inputs: EscalationInput[]): string;
     set<T extends Json>(key: string, value: T): void;
     get<T extends Json>(key: string): T;
     clone(newId?: boolean): StateContext;

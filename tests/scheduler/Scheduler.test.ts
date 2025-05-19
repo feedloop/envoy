@@ -8,6 +8,7 @@ import { PostgresJobRepo } from '../../src/scheduler/PostgresJobRepo';
 import { Scheduler } from '../../src/scheduler/Scheduler';
 import { StateMachine } from '../../src/core/StateMachine';
 import { StateObject } from '../../src/core/StateObject';
+import { PostgresEscalationRepo } from '../../src/scheduler/PostgresEscalationRepo';
 
 const testStateMachine = new StateMachine([
   {
@@ -726,5 +727,144 @@ describe('Scheduler orphaned job cleanup', () => {
     expect(spyCleanup).toHaveBeenCalled();
     scheduler.stop();
     jest.useRealTimers();
+  });
+});
+
+describe('Scheduler escalations', () => {
+  let pool: Pool;
+  let repo: PostgresJobRepo;
+  let escalationRepo: PostgresEscalationRepo;
+  let redis: Redis;
+  let scheduler: Scheduler;
+
+  const dbConfig = {
+    host: process.env.PGHOST!,
+    port: Number(process.env.PGPORT!),
+    user: process.env.PGUSER!,
+    password: process.env.PGPASSWORD!,
+    database: process.env.PGTESTDATABASE!,
+    adminDatabase: process.env.PGADMINDATABASE || process.env.PGDATABASE!,
+  };
+
+  beforeAll(async () => {
+    await runMigrations(dbConfig, true);
+    pool = new Pool(dbConfig);
+    repo = new PostgresJobRepo(pool);
+    escalationRepo = new PostgresEscalationRepo(pool);
+    redis = new Redis({
+      host: process.env.REDIS_HOST || 'localhost',
+      port: Number(process.env.REDIS_PORT) || 6379,
+      password: process.env.REDIS_PASSWORD || undefined,
+      db: 0,
+    });
+    scheduler = new Scheduler(repo, redis, { maxRetries: 0 }, escalationRepo);
+  });
+
+  afterAll(async () => {
+    if (scheduler && typeof scheduler.stopExecutionLoop === 'function') {
+      scheduler.stopExecutionLoop();
+    }
+    if (repo && typeof repo.close === 'function') {
+      await repo.close();
+    }
+    await redis.quit();
+  });
+
+  afterEach(async () => {
+    await pool.query('TRUNCATE TABLE jobs CASCADE');
+    await pool.query('TRUNCATE TABLE escalations CASCADE');
+    await redis.flushdb();
+  });
+
+  it('should create and list an escalation', async () => {
+    // State machine that triggers an escalation
+    const escalateSM = new StateMachine([
+      {
+        name: 'start',
+        onState: async ctx => {
+          ctx.escalate('alice', 'Approve this?', [
+            { id: 'reason', type: 'select', label: 'Reason', options: { a: 'A', b: 'B' } },
+            { id: 'note', type: 'comment', label: 'Note' }
+          ]);
+          return ctx;
+        },
+        router: { next: null }
+      }
+    ]);
+    scheduler.addStateMachine('escalate', escalateSM);
+    const jobId = await scheduler.schedule('escalate', {});
+    await scheduler.runPendingJobs();
+    // There should be a pending escalation in the DB
+    const escalations = await escalationRepo.listPendingEscalations();
+    expect(escalations.length).toBe(1);
+    expect(escalations[0].user).toBe('alice');
+    expect(escalations[0].status).toBe('pending');
+  });
+
+  it('should approve an escalation and unblock the job', async () => {
+    const escalateSM = new StateMachine([
+      {
+        name: 'start',
+        onState: async ctx => {
+          ctx.escalate('bob', 'Approve?', [
+            { id: 'approve', type: 'approve', label: 'Approve?' }
+          ]);
+          return ctx;
+        },
+        router: { next: 'done' }
+      },
+      { name: 'done', onState: async ctx => ctx }
+    ]);
+    scheduler.addStateMachine('escalate2', escalateSM);
+    const jobId = await scheduler.schedule('escalate2', {});
+    await scheduler.runPendingJobs();
+    const escalations = await escalationRepo.listPendingEscalations();
+    expect(escalations.length).toBe(1);
+    const escalation = escalations[0];
+    // Approve the escalation
+    await scheduler.replyToEscalation(escalation.id, { approve: true }, 'approved');
+    // Job should be unblocked and move to done (or running, depending on timing)
+    await scheduler.runPendingJobs();
+    const job = await scheduler.getJob(jobId as string);
+    expect(['done', 'running']).toContain(job.status);
+    // Escalation should be updated
+    const updated = await escalationRepo.getEscalation(escalation.id);
+    expect(updated.status).toBe('approved');
+    expect(updated.response).toEqual({ approve: true });
+  });
+
+  it('should reject an escalation and mark wait as error', async () => {
+    const escalateSM = new StateMachine([
+      {
+        name: 'start',
+        onState: async ctx => {
+          ctx.escalate('bob', 'Approve?', [
+            { id: 'approve', type: 'approve', label: 'Approve?' }
+          ]);
+          return ctx;
+        },
+        router: { next: 'done' }
+      },
+      { name: 'done', onState: async ctx => ctx }
+    ]);
+    scheduler.addStateMachine('escalate3', escalateSM);
+    const jobId = await scheduler.schedule('escalate3', {});
+    await scheduler.runPendingJobs();
+    const escalations = await escalationRepo.listPendingEscalations();
+    expect(escalations.length).toBe(1);
+    const escalation = escalations[0];
+    // Reject the escalation
+    await scheduler.replyToEscalation(escalation.id, { approve: false }, 'rejected');
+    // Job should be unblocked and move to done (or error, depending on your workflow)
+    await scheduler.runPendingJobs();
+    const job = await scheduler.getJob(jobId as string);
+    // The job context should reflect the error in the escalation wait
+    const ctx = StateObject.from(job.context);
+    const waiting = ctx.getWaitingMap();
+    expect(Object.values(waiting)[0].status).toBe('error');
+    // Escalation should be updated
+    const updated = await escalationRepo.getEscalation(escalation.id);
+    expect(updated.status).toBe('rejected');
+    expect(updated.response).toEqual({ approve: false });
   });
 }); 

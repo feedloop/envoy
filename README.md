@@ -261,6 +261,27 @@ docker-compose up --build
 - **State Machine:** Defines the workflow logic for a job, with named states and transitions.
 - **Parent/Child Jobs:** A job can spawn child jobs and wait for their results.
 - **Blocking/Waiting:** Jobs can block on external events or child jobs, and resume when unblocked.
+
+### Human-in-the-Loop Escalation
+- **Escalation:** A job can trigger a human escalation, blocking until a human approves or rejects it. Escalations are tracked in the `escalations` table and can be listed, approved, or rejected via the API or repository.
+- **How to trigger:** Use `ctx.escalate(user, message, inputs)` in your state machine to block and require human input. Example:
+
+```ts
+onState: async ctx => {
+  ctx.escalate('alice', 'Approve this action?', [
+    { id: 'reason', type: 'select', label: 'Reason', options: { a: 'A', b: 'B' } },
+    { id: 'note', type: 'comment', label: 'Note' }
+  ]);
+  return ctx;
+}
+```
+- **How to reply:** Use `scheduler.replyToEscalation(escalationId, { reason: 'a', note: 'Looks good' }, 'approved')` to approve, or use `'rejected'` to reject. The job will resume or error accordingly.
+
+```ts
+await scheduler.replyToEscalation(escalationId, { reason: 'a', note: 'OK' }, 'approved');
+```
+- **Escalation status:** Escalations can be `pending`, `approved`, or `rejected`. The job will unblock and continue after a reply.
+
 - **Retries:** Jobs can be retried on failure up to a configurable limit.
 
 ---

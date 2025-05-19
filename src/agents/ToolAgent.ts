@@ -23,10 +23,6 @@ export class ToolAgent extends StateMachine {
     You will need to decide if you need to call the tool again or if you can proceed to solve the task.
     `;
 
-    private _reflectPrompt = `
-
-    `
-
     private renderPlanPrompt(): string {
         let planPrompt = harmonizeSpacing(this._planPrompt);
         planPrompt += `\n\nTOOLS: \n${this._tools.map(t => JSON.stringify({name: t.name, description: t.description, parameters: t.parameters})).join('\n')}`;

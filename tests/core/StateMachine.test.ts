@@ -78,7 +78,7 @@ describe('StateMachine', () => {
             { name: 'A', onState: async (ctx) => { ctx.set('visitedA', true); return ctx; }, router: { next: 'B' } },
             { name: 'B', onState: async (ctx) => ctx, router: {
                 routes: { C: { description: 'to C' }, D: { description: 'to D' } },
-                router: async (ctx) => {
+                onRoute: async (ctx) => {
                     const val = ctx.get('goToC');
                     // eslint-disable-next-line no-console
                     

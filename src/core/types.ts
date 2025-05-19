@@ -54,7 +54,7 @@ export type StateRouter = {next: string | null} | {
             default?: boolean;
         }
     }
-    router: (ctx: StateContext) => Promise<RouteResult | null>;
+    onRoute: (ctx: StateContext) => Promise<RouteResult | null>;
 }
 
 export type WaitFor = {

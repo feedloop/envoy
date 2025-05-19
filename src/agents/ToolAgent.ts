@@ -107,7 +107,7 @@ export class ToolAgent extends StateMachine {
                         ToolCall: { description: 'Call tools' },
                         Finish: { description: 'Done' }
                     },
-                    router: async (ctx: StateContext) => {
+                    onRoute: async (ctx: StateContext) => {
                         let output = ctx.output<{ messages: LlmMessage[], result: LlmResponse }>();
                         if (output) {
                             let {messages, result} = output;

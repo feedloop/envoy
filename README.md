@@ -43,17 +43,6 @@ npm install
 
 ### Environment Variables
 Copy `.env.example` to `.env` and fill in your database and Redis connection details:
-```
-PGHOST=localhost
-PGPORT=5432
-PGUSER=youruser
-PGPASSWORD=yourpass
-PGDATABASE=envoy
-PGTESTDATABASE=envoy_test
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=
-```
 
 ### StateMachine Concept: Minimal Example
 
@@ -99,9 +88,75 @@ const sm = new StateMachine([
 
 ### Routing Between States
 
-Routing determines which state to transition to next. You can use:
-- `router: { next: 'StateName' }` for static routing.
-- `router: { router: async (ctx) => ({ state: 'NextState', input: ... }) }` for dynamic routing based on context.
+Routing determines which state to transition to next after a state handler completes. There are two main approaches:
+
+#### 1. Static Routing
+Use `router: { next: 'StateName' }` to always go to a specific state:
+
+```ts
+{
+  name: 'A',
+  onState: async ctx => { /* ... */ return ctx; },
+  router: { next: 'B' }
+}
+```
+
+#### 2. Dynamic Routing (Router Function)
+Use a `router` function to decide the next state based on context, output, or any logic:
+
+```ts
+{
+  name: 'A',
+  onState: async ctx => {
+    ctx.output(Math.random());
+    return ctx;
+  },
+  router: {
+    onRoute: async ctx => {
+      const value = ctx.output<number>();
+      if (value > 0.5) {
+        return { state: 'B', input: value };
+      } else {
+        return { state: 'C', input: value };
+      }
+    }
+  }
+}
+```
+
+- The router function can return `{ state: 'NextState', input: ... }` to pass input to the next state.
+- You can implement conditional branching, loops, or even end the workflow by returning `{ state: null }`.
+
+#### 3. Example: Conditional Branching
+
+```ts
+{
+  name: 'Check',
+  onState: async ctx => {
+    ctx.output(ctx.input<number>());
+    return ctx;
+  },
+  router: {
+    onRoute: async ctx => {
+      return ctx.output<number>() > 10
+        ? { state: 'Big', input: ctx.output() }
+        : { state: 'Small', input: ctx.output() };
+    }
+  }
+},
+{
+  name: 'Big',
+  onState: async ctx => { ctx.output('Big number!'); return ctx; },
+  router: { next: null }
+},
+{
+  name: 'Small',
+  onState: async ctx => { ctx.output('Small number!'); return ctx; },
+  router: { next: null }
+}
+```
+
+This allows you to build complex, data-driven workflows with flexible transitions between states.
 
 ---
 

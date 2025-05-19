@@ -82,7 +82,7 @@ export class StateNode {
                 proposedNext = {state: this._router.next, input: ctx.output() ?? null};
             }
         } else if ("routes" in this._router) {
-            proposedNext = await this._router.router(ctx);
+            proposedNext = await this._router.onRoute(ctx);
         }
 
         // Debug: print proposedNext before plugins

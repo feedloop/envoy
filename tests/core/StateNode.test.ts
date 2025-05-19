@@ -85,7 +85,7 @@ describe('StateNode', () => {
                     B: { description: 'to B' },
                     C: { description: 'to C' }
                 },
-                router: async (ctx) => {return {state: 'C', input: null}},
+                onRoute: async (ctx) => {return {state: 'C', input: null}},
             },
             onState: async (ctx) => ctx
         };
@@ -150,7 +150,7 @@ describe('StateNode', () => {
             name: 'A',
             router: {
                 next: 'B',
-                router: async () => {return {state: 'Z', input: null}}, // Z does not exist
+                onRoute: async () => {return {state: 'Z', input: null}}, // Z does not exist
             },
             onState: async (ctx) => ctx
         };

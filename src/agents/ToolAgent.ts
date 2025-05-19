@@ -32,7 +32,8 @@ export class ToolAgent extends StateMachine {
     private renderUserPrompt(text: string): string {
         let userPrompt = harmonizeSpacing(`
         ${text}
-
+        
+        WHATS NEXT? WRITE ONE PLAN IN RESPONSE TO THE USER PROMPT!
         ANSWER in FOLLOWING JSON FORMAT:
         {
             plan: <string, note: try to understand the task, then your plan what to do next, decide whether it is calling a tool, you are finished with the result>,
@@ -43,9 +44,9 @@ export class ToolAgent extends StateMachine {
                 tool: <string, tool name, must be one of the tools provided, dont add any prefix or suffix>,
                 args: <{...}, arguments>
             }]
-        } <--- SINGLE PLAN OBJECT
+        } <--- SINGLE PLAN OBJECT, DO NOT WRITE MORE THAN ONE PLAN OBJECT!
 
-        Respond with ONLY valid JSON only one plan object, no extra text, comments, or formatting!!!
+        STOP AFTER ...}
         `)
         return userPrompt;
     }

@@ -13,6 +13,31 @@ export type RouteResult = {
     input: Json;
 }
 
+export type EscalationInput = SelectInput | CommentInput | ApproveInput;
+
+type SelectInput = {
+    id: string;
+    type: "select";
+    label: string;
+    options: {
+        [key: string]: string;
+    }
+}
+
+type CommentInput = {
+    id: string;
+    type: "comment";
+    label: string;
+}
+
+type ApproveInput = {
+    id: string;
+    type: "approve";
+    label: string;
+}
+
+
+
 export type StateDescriptor<T extends StateContext = StateContext> = {
     name: string;
     router?: StateRouter;
@@ -42,6 +67,7 @@ export type WaitingContext = WaitFor & {
     status: "pending" | "success" | "error";
     output?: Json;
     error?: Json;
+    childJobId?: string;
 }
 
 export type StateContext = {
@@ -49,7 +75,9 @@ export type StateContext = {
     step(): number;
     input<T extends Json>(): T;
     done(): "finished" | "error" | "cancelled" | "maxSteps" | null;
-    output<T extends Json>(output?: T): T | undefined;
+    output<T extends Json>(): T | undefined;
+    output<T extends Json>(output: T): T | undefined;
+    output<T extends Json>(path: string, value: T): void;
     waitFor(waitlist: WaitFor[]): void;
     isWaitingFor(): string[];
     set<T extends Json>(key: string, value: T): void;

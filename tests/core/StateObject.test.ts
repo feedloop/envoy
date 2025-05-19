@@ -85,8 +85,6 @@ describe('StateObject', () => {
         const obj = new StateObject('s', 1, 'i');
         obj.output(null);
         expect(obj.output()).toBeNull();
-        obj.output(undefined);
-        expect(obj.output()).toBeUndefined();
         obj.output(0);
         expect(obj.output()).toBe(0);
         obj.output('');
@@ -115,5 +113,30 @@ describe('StateObject', () => {
         const obj = new StateObject('s', 1, 'i');
         obj.waitFor([]);
         expect(obj.isWaitingFor()).toEqual([]);
+    });
+
+    it('handles output subfield writing and reading', () => {
+        const obj = new StateObject('s', 1, 'i');
+        obj.output('jobs.child1', { result: 123 });
+        obj.output('jobs.child2', { result: 456 });
+        expect(obj.output()).toEqual({ jobs: { child1: { result: 123 }, child2: { result: 456 } } });
+        // Overwrite a subfield
+        obj.output('jobs.child1', { result: 789 });
+        // Helper to get nested field
+        const getNested = (obj: any, path: string) => path.split('.').reduce((o, k) => (o && o[k] !== undefined ? o[k] : undefined), obj);
+        expect(getNested(obj.output(), 'jobs.child1')).toEqual({ result: 789 });
+    });
+
+    it('spawn creates a waitFor entry of type spawn', () => {
+        const obj = new StateObject('s', 1, 'i');
+        const id = obj.spawn('mySM', { foo: 42 });
+        const waiting = obj.getWaitingMap();
+        expect(waiting && waiting[id]).toBeDefined();
+        if (waiting && waiting[id]) {
+            expect(waiting[id].type).toBe('spawn');
+            expect(waiting[id].params?.sm).toBe('mySM');
+            expect(waiting[id].params?.input).toEqual({ foo: 42 });
+        }
+        expect(obj.isWaitingFor()).toContain(id);
     });
 }); 

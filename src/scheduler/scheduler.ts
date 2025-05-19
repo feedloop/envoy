@@ -8,6 +8,7 @@ import { SerializedState } from "../core/types";
 
 interface SchedulerOptions {
     concurrency?: number;
+    maxRetries?: number;
 }
 
 export class Scheduler {
@@ -16,10 +17,13 @@ export class Scheduler {
     private _concurrency: number;
     private _executionLoopTimer?: NodeJS.Timeout;
     private _executionLoopActive: boolean = false;
+    private _cleanupTimer?: NodeJS.Timeout;
+    private _maxRetries: number;
 
     constructor(private _jobRepo: JobRepo, private _redis: Redis, options: SchedulerOptions = {}) {
         this._workerId = uuidv4();
         this._concurrency = options.concurrency ?? 4;
+        this._maxRetries = options.maxRetries ?? 3;
     }
 
     public stateMachine(name: string): StateMachine {
@@ -39,6 +43,7 @@ export class Scheduler {
             stateMachine: name,
             status: "pending",
             context: context.serialize(),
+            retries: 0,
         });
         return job.id;
     }
@@ -90,6 +95,25 @@ export class Scheduler {
                 const sm = this.stateMachine(runningJob.stateMachine);
                 let ctx = StateObject.from(runningJob.context as SerializedState);
                 ctx = await sm.step(ctx) as StateObject; // If this throws, catch below
+                // Handle spawn jobs
+                const waitingMap = ctx.getWaitingMap();
+                for (const waitId of ctx.isWaitingFor()) {
+                    const wait = waitingMap[waitId];
+                    if (wait.type === 'spawn' && wait.status === 'pending' && !wait.childJobId && wait.params && typeof wait.params.sm === 'string') {
+                        // Create child job
+                        const childJob = await this._jobRepo.createJob({
+                            stateMachine: wait.params.sm,
+                            status: 'pending',
+                            context: this.stateMachine(wait.params.sm).newContext(wait.params.input).serialize(),
+                            parent_id: job.id,
+                            retries: 0,
+                        });
+                        // Store mapping for easier resolution
+                        wait.childJobId = childJob.id;
+                    }
+                }
+                // Save updated context if any child jobs were created
+                await this._jobRepo.updateJob(job.id, { context: ctx.serialize() });
                 // Handle blocking jobs
                 if (ctx.isWaitingFor && ctx.isWaitingFor().length > 0) {
                     const jobStr = await this._redis.get(`job:${job.id}`);
@@ -121,6 +145,7 @@ export class Scheduler {
                     startedAt: jobData.startedAt ?? null,
                     finishedAt: jobData.finishedAt ?? null,
                     error: jobData.error ?? null,
+                    retries: jobData.retries ?? 0,
                 };
             } catch {
                 // fallback to DB
@@ -150,6 +175,38 @@ export class Scheduler {
      * Mark a job as completed, update Postgres and clean up Redis.
      */
     public async completeJob(jobId: string): Promise<void> {
+        // Child job completion logic for spawn
+        const job = await this._jobRepo.getJob(jobId);
+        if (job.parent_id) {
+            // 1. Load parent job and context
+            const parentJob = await this._jobRepo.getJob(job.parent_id);
+            const parentCtx = StateObject.from(parentJob.context as SerializedState);
+            const waitingMap = parentCtx.getWaitingMap();
+            // 2. Find the waitFor entry for this child
+            for (const waitId in waitingMap) {
+                const wait = waitingMap[waitId];
+                if (wait.type === 'spawn' && wait.childJobId === jobId) {
+                    // 3. Write result to output
+                    let childOutput: Json | null = null;
+                    try {
+                        childOutput = StateObject.from(job.context as SerializedState).output() ?? null;
+                    } catch { /* fallback to null */ }
+                    parentCtx.output(`jobs.${jobId}`, childOutput);
+                    // 4. Mark as resolved
+                    parentCtx.resolve(waitId, "success", childOutput);
+                }
+            }
+            // 5. Save updated parent context
+            await this._jobRepo.updateJob(parentJob.id, { context: parentCtx.serialize() });
+            // 6. If all waitFor resolved, requeue parent
+            if (parentCtx.isWaitingFor().length === 0) {
+                await this._jobRepo.updateJob(parentJob.id, { status: 'pending', context: parentCtx.serialize() });
+                await this._redis.rpush('job_queue', parentJob.id);
+                // Immediately process the parent job
+                await this.runPendingJobs();
+            }
+        }
+        // Existing completion logic
         const status = await this.getJobStatus(jobId);
         if (!['failed', 'cancelled', 'done'].includes(status)) {
             await this._jobRepo.setJobStatus(jobId, 'done');
@@ -161,12 +218,44 @@ export class Scheduler {
 
     /**
      * Mark a job as failed, update Postgres and clean up Redis.
+     * If retries < maxRetries, increment retries and requeue as pending.
      */
     public async failJob(jobId: string, error?: string): Promise<void> {
-        await this._jobRepo.setJobStatus(jobId, 'failed', error);
-        await this._redis.srem('running_jobs', jobId);
-        await this._redis.del(`job:${jobId}`);
-        await this._redis.lrem('job_queue', 0, jobId);
+        const job = await this._jobRepo.getJob(jobId);
+        if (job.parent_id) {
+            // 1. Load parent job and context
+            const parentJob = await this._jobRepo.getJob(job.parent_id);
+            const parentCtx = StateObject.from(parentJob.context as SerializedState);
+            const waitingMap = parentCtx.getWaitingMap();
+            // 2. Find the waitFor entry for this child
+            for (const waitId in waitingMap) {
+                const wait = waitingMap[waitId];
+                if (wait.type === 'spawn' && wait.childJobId === jobId) {
+                    // 3. Mark as error
+                    parentCtx.resolve(waitId, "error", error ?? "Child job failed");
+                }
+            }
+            // 4. Save updated parent context
+            await this._jobRepo.updateJob(parentJob.id, { context: parentCtx.serialize() });
+            // 5. If all waitFor resolved, requeue parent
+            if (parentCtx.isWaitingFor().length === 0) {
+                await this._jobRepo.updateJob(parentJob.id, { status: 'pending', context: parentCtx.serialize() });
+                await this._redis.rpush('job_queue', parentJob.id);
+                // Immediately process the parent job
+                await this.runPendingJobs();
+            }
+        }
+        // Retry logic
+        if (job.retries < this._maxRetries) {
+            await this._jobRepo.updateJob(jobId, { retries: job.retries + 1, status: 'pending' });
+            await this._redis.rpush('job_queue', jobId);
+        } else {
+            // Existing fail logic
+            await this._jobRepo.setJobStatus(jobId, 'failed', error);
+            await this._redis.srem('running_jobs', jobId);
+            await this._redis.del(`job:${jobId}`);
+            await this._redis.lrem('job_queue', 0, jobId);
+        }
     }
 
     /**
@@ -330,5 +419,41 @@ export class Scheduler {
                 status: jobData.status,
             }).catch(() => {});
         }, 0);
+    }
+
+    /**
+     * Scans for jobs stuck in 'pending' or 'running' for too long and marks them as failed.
+     * @param maxAgeMs Maximum allowed age in milliseconds (default: 1 hour)
+     */
+    public async cleanupOrphanedJobs(maxAgeMs: number = 60 * 60 * 1000): Promise<void> {
+        const jobs = await this._jobRepo.getStuckJobs(['pending', 'running'], maxAgeMs);
+        for (const job of jobs) {
+            await this.failJob(job.id, 'Orphaned job: exceeded max allowed age');
+            console.warn(`Orphaned job ${job.id} marked as failed.`);
+        }
+    }
+
+    /**
+     * Starts the execution loop and schedules periodic orphaned job cleanup.
+     * @param intervalMs Polling interval for execution loop (default 1000)
+     * @param cleanupIntervalMs How often to run orphaned job cleanup (default 1 hour)
+     * @param orphanMaxAgeMs Max age for a job to be considered orphaned (default 1 hour)
+     */
+    public start(intervalMs: number = 1000, cleanupIntervalMs: number = 60 * 60 * 1000, orphanMaxAgeMs: number = 60 * 60 * 1000): void {
+        this.startExecutionLoop(intervalMs);
+        this._cleanupTimer = setInterval(() => {
+            this.cleanupOrphanedJobs(orphanMaxAgeMs).catch(console.error);
+        }, cleanupIntervalMs);
+    }
+
+    /**
+     * Stops the execution loop and orphaned job cleanup.
+     */
+    public stop(): void {
+        this.stopExecutionLoop();
+        if (this._cleanupTimer) {
+            clearInterval(this._cleanupTimer);
+            this._cleanupTimer = undefined;
+        }
     }
 }

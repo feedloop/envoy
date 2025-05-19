@@ -8,5 +8,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     started_at TIMESTAMP,
     finished_at TIMESTAMP,
-    error TEXT
+    error TEXT,
+    parent_id UUID NULL,
+    retries INTEGER NOT NULL DEFAULT 0
 ); 

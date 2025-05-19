@@ -1,5 +1,4 @@
 import { SerializedState, StateContext } from "../core/types";
-import { Json } from "../types";
 
 export type JobStatus = "pending" | "running" | "done" | "failed" | "cancelled" | "blocking";
 
@@ -7,12 +6,14 @@ export interface JobSchema {
     id: string;
     stateMachine: string;
     status: JobStatus;
-    context: Json; // serialized context (JSON)
+    context: SerializedState;
     createdAt: Date;
     updatedAt: Date;
     startedAt?: Date | null;
     finishedAt?: Date | null;
     error?: string | null;
+    parent_id?: string | null;
+    retries: number;
 }
 
 export interface JobRepo {
@@ -21,4 +22,5 @@ export interface JobRepo {
     updateJob(id: string, updates: Partial<JobSchema>): Promise<JobSchema>;
     getPendingJobs(limit?: number): Promise<JobSchema[]>;
     setJobStatus(id: string, status: JobStatus, error?: string): Promise<JobSchema>;
+    getStuckJobs(statuses: string[], maxAgeMs: number): Promise<JobSchema[]>;
 }

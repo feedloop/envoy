@@ -17,19 +17,26 @@ const MIGRATIONS_DIR = path.join(__dirname, '../migrations');
 /**
  * Ensures the target database exists by connecting to an admin database (default: 'postgres').
  */
-export async function ensureDatabaseExists(config: MigrationConfig): Promise<void> {
+export async function ensureDatabaseExists(config: MigrationConfig, alwaysClean = false): Promise<void> {
   const adminDb = config.adminDatabase || 'postgres';
   const adminConfig = { ...config, database: adminDb };
   const client = new Client(adminConfig);
   await client.connect();
   const dbName = config.database;
-  const res = await client.query(
-    `SELECT 1 FROM pg_database WHERE datname = $1`,
-    [dbName]
-  );
-  if (res.rowCount === 0) {
+  if (alwaysClean) {
+    await client.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, [dbName]);
+    await client.query(`DROP DATABASE IF EXISTS "${dbName}"`);
     await client.query(`CREATE DATABASE "${dbName}"`);
-    console.log(`Created database: ${dbName}`);
+    console.log(`Dropped and created database: ${dbName}`);
+  } else {
+    const res = await client.query(
+      `SELECT 1 FROM pg_database WHERE datname = $1`,
+      [dbName]
+    );
+    if (res.rowCount === 0) {
+      await client.query(`CREATE DATABASE "${dbName}"`);
+      console.log(`Created database: ${dbName}`);
+    }
   }
   await client.end();
 }
@@ -37,8 +44,8 @@ export async function ensureDatabaseExists(config: MigrationConfig): Promise<voi
 /**
  * Runs migrations on the target database, ensuring it exists first.
  */
-export async function runMigrations(config: MigrationConfig): Promise<void> {
-  await ensureDatabaseExists(config);
+export async function runMigrations(config: MigrationConfig, alwaysClean = false): Promise<void> {
+  await ensureDatabaseExists(config, alwaysClean);
   const client = new Client(config);
   await client.connect();
   try {
@@ -79,6 +86,8 @@ export async function runMigrations(config: MigrationConfig): Promise<void> {
 // @ts-ignore
 if (require.main === module) {
   dotenv.config();
+  const alwaysClean = process.argv.includes('--clean');
+  console.log('Running migrations on database:', process.env.PGDATABASE!);
   runMigrations({
     host: process.env.PGHOST!,
     port: Number(process.env.PGPORT!),
@@ -86,7 +95,7 @@ if (require.main === module) {
     password: process.env.PGPASSWORD!,
     database: process.env.PGDATABASE!,
     adminDatabase: process.env.PGADMINDATABASE || 'postgres',
-  }).catch(err => {
+  }, alwaysClean).catch(err => {
     console.error('Migration failed:', err);
     process.exit(1);
   });

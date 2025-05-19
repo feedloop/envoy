@@ -73,11 +73,10 @@ export class StateMachine<T extends StateContext = StateContext> {
         return this._nodes.find(node => node.name === name) || null;
     }
 
-    public addNode(node: StateNode, start: boolean = false): void {
-        if (start || this._nodes.length === 0) {
-            this._startState = node.name;
-        }
+    public createNode(descriptor: StateDescriptor): StateNode {
+        let node = new StateNode(this, descriptor);
         this._nodes.push(node);
+        return node;
     }
 
     public plugins(): StateMachinePlugin[] {

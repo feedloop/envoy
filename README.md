@@ -1,286 +1,316 @@
-# Envoy: Modular State Machine Agent Framework
+# Envoy Workflow & Job Scheduler
 
-## Overview
+## 1. Project Overview
 
-Envoy is a modular, extensible framework for building state machine-driven agents that can leverage LLMs (like OpenAI) and custom tools. It is designed for orchestrating complex, multi-step reasoning and tool-use workflows, with a clear separation between state management, agent logic, and LLM/tool integration.
+Envoy is a modular, extensible workflow engine and job scheduler for AI use cases built on Node.js, PostgreSQL, and Redis. It enables robust orchestration of complex, multi-step jobs using state machines, with support for parent/child workflows, retries, blocking, and distributed execution.
 
----
-
-## Directory Structure
-
-- `src/llm/` — LLM provider abstraction and OpenAI integration.
-- `src/core/` — State machine engine, nodes, context, and plugin system.
-- `src/agents/` — Agent implementations (e.g., `ToolAgent`) and agent-specific types.
-
----
-
-## Core Concepts
-
-### State Machine Engine (`src/core`)
-
-- **StateMachine**: Orchestrates transitions between states, supports plugins, and manages execution flow.
-- **StateNode**: Represents a state; handles `onEnter`, `onState`, `onExit`, and routing logic.
-- **StateObject**: Implements the context passed between states, tracking input, output, waiting, and execution state.
-- **Plugins**: Extend or intercept state transitions and routing.
-
-### LLM Integration (`src/llm`)
-
-- **LlmProvider**: Abstract interface for LLMs.
-- **OpenAIProvider**: Implements `LlmProvider` for OpenAI's API, supporting tool calls and structured (JSON/XML) responses.
-- **LlmMessage**: Unified message format for user, assistant, system, and tool messages.
-
-### Agent Layer (`src/agents`)
-
-- **ToolAgent**: A state machine agent that plans, calls tools, and produces answers using an LLM.
-- **AgentTool**: Defines a tool (name, description, parameters, handler).
-- **AgentOptions**: Configures tools, plugins, prompts, and execution limits.
+**Key Features:**
+- State machine-driven job orchestration
+- Parent/child (spawn) workflows
+- Blocking, waiting, and external event resolution
+- Robust retry and orphaned job cleanup
+- Pluggable state machines and custom job types
+- PostgreSQL for durability, Redis for fast distributed coordination
 
 ---
 
-## Example: Creating a Custom StateMachine
+## 2. Architecture
 
-You can use the core state machine engine directly to model any workflow. Here is a minimal example with two states and a transition:
+- **Scheduler:** Orchestrates job execution, manages queues, retries, and blocking.
+- **StateMachine:** Defines workflow logic as a series of states and transitions.
+- **JobRepo:** Persists jobs and their state in PostgreSQL.
+- **Redis:** Used for distributed job queues, locks, and fast status checks.
+
+```
+[Client/API] → [Scheduler] → [StateMachine] → [JobRepo (Postgres)]
+                                 ↓
+                              [Redis]
+```
+
+---
+
+## 3. Getting Started
+
+### Prerequisites
+- Node.js (v18+ recommended)
+- PostgreSQL (14+)
+- Redis (6+)
+
+### Installation
+```sh
+npm install
+```
+
+### Environment Variables
+Copy `.env.example` to `.env` and fill in your database and Redis connection details:
+```
+PGHOST=localhost
+PGPORT=5432
+PGUSER=youruser
+PGPASSWORD=yourpass
+PGDATABASE=envoy
+PGTESTDATABASE=envoy_test
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=
+```
+
+### StateMachine Concept: Minimal Example
+
+A StateMachine is a workflow defined as a series of named states (nodes) and transitions. Each state can perform logic and decide what state to go to next.
 
 ```ts
 import { StateMachine } from './src/core/StateMachine';
-import { StateDescriptor, StateContext } from './src/core/types';
 
-const states: StateDescriptor[] = [
+const sm = new StateMachine([
   {
     name: 'Start',
-    onState: async (ctx) => {
-      ctx.output('Hello from Start!');
+    onState: async ctx => {
+      ctx.output('Hello!');
+      return ctx;
+    },
+    router: { next: 'Middle' }
+  },
+  {
+    name: 'Middle',
+    onState: async ctx => {
+      ctx.output(ctx.output() + ' Middle!');
       return ctx;
     },
     router: { next: 'End' }
   },
   {
     name: 'End',
-    onState: async (ctx) => {
-      ctx.output('Reached End.');
+    onState: async ctx => {
+      ctx.output(ctx.output() + ' End!');
       return ctx;
     },
     router: { next: null }
   }
-];
-
-const sm = new StateMachine(states, { startState: 'Start' });
+]);
 
 (async () => {
-  const ctx = await sm.run('Initial input');
-  console.log(ctx.serialize());
+  const ctx = await sm.run();
+  console.log(ctx.output()); // "Hello! Middle! End!"
 })();
 ```
 
 ---
 
-## Working with the State Context (`ctx`)
+### Routing Between States
 
-The `ctx` object (context) is passed to every state handler and provides methods for managing state, data, and flow. Here are the most common operations:
+Routing determines which state to transition to next. You can use:
+- `router: { next: 'StateName' }` for static routing.
+- `router: { router: async (ctx) => ({ state: 'NextState', input: ... }) }` for dynamic routing based on context.
 
-### Accessing Input and Output
+---
 
-```ts
-// Get the input provided to this state
-const input = ctx.input<string>();
+### State Handlers: onEnter, onState, onExit
 
-// Set or get the output for this state
-ctx.output('Some result');
-const result = ctx.output<string>();
-```
-
-### Storing and Retrieving Data
+- `onEnter`: Runs when entering the state (optional).
+- `onState`: Main logic for the state (required).
+- `onExit`: Runs when leaving the state (optional).
 
 ```ts
-// Store arbitrary data in the context
-ctx.set('myKey', 42);
-
-// Retrieve stored data
-const value = ctx.get<number>('myKey');
-```
-
-### Waiting for External Events
-
-```ts
-// Wait for an external event (e.g., async operation, user input)
-ctx.waitFor([
-  { id: 'wait1', type: 'external', params: { info: 'something' } }
-]);
-
-// Check if still waiting
-if (ctx.isWaitingFor().length > 0) {
-  // handle waiting logic
+{
+  name: 'Example',
+  onEnter: async ctx => { ctx.set('entered', true); return ctx; },
+  onState: async ctx => { /* main logic */ return ctx; },
+  onExit: async ctx => { ctx.set('exited', true); return ctx; },
+  router: { next: null }
 }
-
-// Resolve a waiting event
-ctx.resolve('wait1', 'success', { data: 'done' });
-```
-
-### Error Handling
-
-```ts
-// Mark the context as errored
-ctx.error('Something went wrong');
-
-// Check if the state machine is done due to error
-if (ctx.done() === 'error') {
-  // handle error
-}
-```
-
-### Cloning and Serializing Context
-
-```ts
-// Clone the context (useful for immutability in transitions)
-const newCtx = ctx.clone();
-
-// Serialize for logging or persistence
-console.log(ctx.serialize());
 ```
 
 ---
 
-## StateMachine and StateContext Interfaces
+### The ctx Object: input, output, set, get
 
-### StateMachine (class)
-
-The `StateMachine` class provides the main API for orchestrating state transitions:
-
-```ts
-class StateMachine<T extends StateContext = StateContext> {
-  constructor(states: StateDescriptor[], options?: StateMachineOptions);
-  nodes(): StateNode[];
-  node(name: string): StateNode | null;
-  addNode(node: StateNode, start?: boolean): void;
-  plugins(): StateMachinePlugin[];
-  plugin(name: string): StateMachinePlugin | null;
-  addPlugin(plugin: StateMachinePlugin): void;
-  step(ctx: T): Promise<T>;
-  newContext(input: string): T;
-  run(input: string): Promise<T>;
-  drawGraph(): string;
-}
-```
-
-- **nodes()**: List all state nodes.
-- **node(name)**: Get a node by name.
-- **addNode(node, start?)**: Add a node (optionally as start).
-- **plugins() / plugin(name) / addPlugin(plugin)**: Manage plugins.
-- **step(ctx)**: Advance the state machine by one step.
-- **newContext(input)**: Create a new context for a run.
-- **run(input)**: Run the state machine to completion.
-- **drawGraph()**: Output a graphviz diagram of the state machine.
-
-### StateContext (interface)
-
-The `StateContext` interface defines the context object passed between states:
+- `ctx.input<T>()`: Get the input for this state.
+- `ctx.output<T>(value?)`: Set or get the output for this state.
+- `ctx.set(key, value)`: Store arbitrary data in the context.
+- `ctx.get<T>(key)`: Retrieve stored data.
 
 ```ts
-interface StateContext {
-  state(): string;
-  step(): number;
-  input<T>(): T;
-  done(): "finished" | "error" | "cancelled" | "maxSteps" | null;
-  output<T>(output?: T): T | undefined;
-  waitFor(waitlist: WaitFor[]): void;
-  isWaitingFor(): string[];
-  set<T>(key: string, value: T): void;
-  get<T>(key: string): T;
-  clone(): StateContext;
-  serialize(): SerializedState;
-  // ...other properties and methods
+onState: async ctx => {
+  const input = ctx.input<string>();
+  ctx.set('foo', 42);
+  ctx.output('Result: ' + input);
+  return ctx;
 }
 ```
-
-- **state()**: Current state name.
-- **step()**: Current step number.
-- **input()**: Input for this state.
-- **done()**: Completion status.
-- **output()**: Set/get output for this state.
-- **waitFor() / isWaitingFor() / resolve()**: Manage waiting for external events.
-- **set() / get()**: Store/retrieve arbitrary data.
-- **clone()**: Clone the context.
-- **serialize()**: Serialize for logging or persistence.
-
-See the "Working with the State Context (`ctx`)" section above for usage examples.
 
 ---
 
-## Creating and Using Plugins (e.g., Logger Plugin)
+### Spawning Child Jobs
 
-Plugins allow you to extend or intercept state transitions, routing, and more. For example, you can create a logger plugin to log every state transition:
+You can spawn child jobs from a parent job and wait for their results:
 
 ```ts
-import { StateMachinePlugin, StateContext } from './src/core/types';
+onState: async ctx => {
+  ctx.spawn('childWorkflow', { some: 'input' });
+  return ctx;
+}
+```
+- The parent job will block until the child job completes, then resume and receive the child's output.
 
-const loggerPlugin: StateMachinePlugin = {
+---
+
+### Plugins: Extending StateMachine Behavior
+
+Plugins allow you to extend or intercept state transitions, add logging, metrics, or custom logic:
+
+```ts
+const myPlugin = {
   name: 'logger',
-  onEnter: async (ctx: StateContext) => {
-    console.log(`[Logger] Entering state: ${ctx.state()} (step ${ctx.step()})`);
-    return ctx;
-  },
-  onExit: async (ctx: StateContext) => {
-    console.log(`[Logger] Exiting state: ${ctx.state()} (step ${ctx.step()})`);
-    return ctx;
-  },
-  onRoute: async (ctx: StateContext, proposedNext) => {
-    if (proposedNext) {
-      console.log(`[Logger] Routing from ${ctx.state()} to ${proposedNext.state}`);
-    }
-    return proposedNext;
-  }
+  onEnter: (ctx, state) => { console.log('Entering', state); },
+  onExit: (ctx, state) => { console.log('Exiting', state); }
 };
+
+const sm = new StateMachine([...], { plugins: [myPlugin] });
 ```
-
-To use a plugin, add it to the `plugins` option when creating your state machine:
-
-```ts
-const sm = new StateMachine(states, {
-  startState: 'Start',
-  plugins: [loggerPlugin]
-});
-```
-
-Now, every state transition and routing decision will be logged to the console.
+- Plugins can hook into `onEnter`, `onExit`, and other lifecycle events.
 
 ---
 
-## Example: ToolAgent Flow
+## 4. Database Setup & Migrations
 
-1. **Start**: Receives a user task, builds a prompt for the LLM.
-2. **Plan**: LLM decides whether to call a tool or finish, returning a structured plan.
-3. **ToolCall**: Executes tool(s) as per the plan, feeds results back to the LLM.
-4. **Finish**: Returns the final answer.
+### Initialize the Database
+```sh
+npm run migrate
+```
+
+### Clean & Recreate Test Database
+```sh
+npm run migrate -- --clean
+```
+
+---
+
+## 5. Running the Application
+
+### Local Development
+```sh
+npm run dev
+```
+
+### With Docker (if available)
+```sh
+docker-compose up --build
+```
+
+---
+
+## 6. Job & Workflow Concepts
+
+- **Job:** A unit of work tracked in the database, processed by a state machine.
+- **State Machine:** Defines the workflow logic for a job, with named states and transitions.
+- **Parent/Child Jobs:** A job can spawn child jobs and wait for their results.
+- **Blocking/Waiting:** Jobs can block on external events or child jobs, and resume when unblocked.
+- **Retries:** Jobs can be retried on failure up to a configurable limit.
+
+---
+
+## 7. API Usage
+
+### Scheduling a Job
+```ts
+const jobId = await scheduler.schedule('myWorkflow', { input: 'data' });
+```
+
+### Querying Job Status
+```ts
+const job = await scheduler.getJob(jobId);
+console.log(job.status); // 'pending', 'running', 'done', 'failed', etc.
+```
+
+### Cancelling or Failing a Job
+```ts
+await scheduler.cancelJob(jobId);
+await scheduler.failJob(jobId, 'reason');
+```
+
+### Resolving a Blocking Job
+```ts
+await scheduler.resolveBlockingJob(jobId, 'waitForId', { result: 42 });
+```
+
+---
+
+## 8. Testing
+
+### Run the Test Suite
+```sh
+npm test
+```
+
+- The test database is dropped and recreated before tests for isolation.
+- Tests cover job scheduling, parent/child workflows, blocking, retries, and orphaned job cleanup.
+
+---
+
+## 9. Implementing a State Machine (Example: ToolAgent)
+
+You can implement custom state machines for your workflows. Here's an example using the built-in `ToolAgent`, which plans and executes tool calls using an LLM:
 
 ```ts
 import { ToolAgent } from './src/agents/ToolAgent';
-import { OpenAIProvider } from './src/llm/openai';
+import { OpenAIProvider } from './src/llm/OpenAIProvider';
 
+// Define your tools
 const tools = [
   {
+    name: 'add',
+    description: 'Add two numbers',
+    parameters: { a: 'number', b: 'number' },
+    handler: async ({ a, b }) => a + b,
+  },
+  {
     name: 'echo',
-    description: 'Echoes the input text',
-    parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
-    handler: async (params) => ({ echoed: params.text })
-  }
+    description: 'Echo a string',
+    parameters: { text: 'string' },
+    handler: async ({ text }) => text,
+  },
 ];
 
-const provider = new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY, tools, model: 'gpt-4o-mini' });
-const agent = new ToolAgent(provider, { tools });
+// Create an LLM provider (e.g., OpenAI)
+const provider = new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY! });
 
-const result = await agent.run('Echo hello world');
-console.log(result.serialize());
+// Instantiate the ToolAgent state machine
+const agent = new ToolAgent(provider, {
+  tools,
+  maxSteps: 10,
+});
+
+// Run the agent with a task
+(async () => {
+  const ctx = await agent.run('What is 2 + 2?');
+  console.log('Final output:', ctx.output());
+})();
 ```
 
+- **Define tools** with a name, description, parameters, and handler function.
+- **Instantiate ToolAgent** with your tools and an LLM provider.
+- **Run the agent** with a user task; the agent will plan, call tools, and return the result.
+
+You can implement your own state machines by extending `StateMachine` and defining custom states and transitions for your workflow needs.
+
 ---
 
-## Testing
+## 10. Contributing
 
-- End-to-end and integration tests are in `tests/`.
-- Real OpenAI API calls are supported (set `OPENAI_API_KEY` in `.env`).
+- Fork the repo and create a feature branch.
+- Write tests for new features or bug fixes.
+- Follow code style and submit a pull request.
 
 ---
 
-## License
+## 11. License
 
-MIT 
+MIT
+
+---
+
+## 12. Acknowledgments
+
+- Inspired by workflow engines, distributed job systems, and state machine libraries.
+- Thanks to all contributors and open source libraries used in this project. 

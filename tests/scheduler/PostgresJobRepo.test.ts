@@ -4,7 +4,7 @@ dotenv.config();
 import { Pool } from 'pg';
 import { runMigrations } from '../../scripts/migrate';
 import { PostgresJobRepo } from '../../src/scheduler/PostgresJobRepo';
-import { JobStatus } from '../../src/scheduler/types';
+import { JobSchema, JobStatus } from '../../src/scheduler/types';
 
 describe('PostgresJobRepo', () => {
   let pool: Pool;
@@ -20,7 +20,7 @@ describe('PostgresJobRepo', () => {
   };
 
   beforeAll(async () => {
-    await runMigrations(dbConfig);
+    await runMigrations(dbConfig, true);
     pool = new Pool(dbConfig);
     repo = new PostgresJobRepo(pool);
   });
@@ -33,13 +33,27 @@ describe('PostgresJobRepo', () => {
     await pool.query('TRUNCATE TABLE jobs');
   });
 
-  const baseJob = {
+  const baseJob: JobSchema = {
+    id: 'test_job',
     stateMachine: 'test_machine',
     status: 'pending' as JobStatus,
-    context: { foo: 'bar' },
+    context: {
+      state: 'start',
+      step: 0,
+      input: {},
+      output: {},
+      waiting: {},
+      data: {},
+      done: null,
+      execState: 'enter',
+    },
+    createdAt: new Date(),
+    updatedAt: new Date(),
     startedAt: null,
     finishedAt: null,
     error: null,
+    parent_id: null,
+    retries: 0,
   };
 
   it('should create and get a job', async () => {

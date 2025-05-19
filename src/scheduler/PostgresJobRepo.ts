@@ -20,17 +20,19 @@ export class PostgresJobRepo implements JobRepo {
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
                 started_at TIMESTAMP,
                 finished_at TIMESTAMP,
-                error TEXT
+                error TEXT,
+                parent_id UUID NULL,
+                retries INT NOT NULL DEFAULT 0
             );
         `);
     }
 
     public async createJob(job: Omit<JobSchema, "id" | "createdAt" | "updatedAt">): Promise<JobSchema> {
         const res = await this.pool.query(
-            `INSERT INTO jobs (id, state_machine, status, context, created_at, updated_at, started_at, finished_at, error)
-             VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW(), $4, $5, $6)
+            `INSERT INTO jobs (id, state_machine, status, context, created_at, updated_at, started_at, finished_at, error, parent_id, retries)
+             VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW(), $4, $5, $6, $7, $8)
              RETURNING *`,
-            [job.stateMachine, job.status, JSON.stringify(job.context), job.startedAt ?? null, job.finishedAt ?? null, job.error ?? null]
+            [job.stateMachine, job.status, JSON.stringify(job.context), job.startedAt ?? null, job.finishedAt ?? null, job.error ?? null, job.parent_id ?? null, (job as any).retries ?? 0]
         );
         return this.rowToJob(res.rows[0]);
     }
@@ -86,6 +88,15 @@ export class PostgresJobRepo implements JobRepo {
         await this.pool.end();
     }
 
+    public async getStuckJobs(statuses: string[], maxAgeMs: number): Promise<JobSchema[]> {
+        const cutoff = new Date(Date.now() - maxAgeMs);
+        const res = await this.pool.query(
+            `SELECT * FROM jobs WHERE status = ANY($1) AND updated_at < $2`,
+            [statuses, cutoff]
+        );
+        return res.rows.map(this.rowToJob);
+    }
+
     private rowToJob(row: any): JobSchema {
         return {
             id: row.id,
@@ -97,6 +108,8 @@ export class PostgresJobRepo implements JobRepo {
             startedAt: row.started_at,
             finishedAt: row.finished_at,
             error: row.error,
+            parent_id: row.parent_id ?? null,
+            retries: row.retries ?? 0,
         };
     }
 

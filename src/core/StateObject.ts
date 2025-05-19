@@ -1,5 +1,5 @@
 import { Json, JsonObject } from "../types";
-import { SerializedState, StateContext, WaitFor, WaitingContext } from "./types";
+import { EscalationInput, SerializedState, StateContext, WaitFor, WaitingContext } from "./types";
 import { v4 as uuidv4 } from 'uuid';
 
 export class StateObject implements StateContext {
@@ -78,11 +78,31 @@ export class StateObject implements StateContext {
         this._input = input;
     }
 
-    public output<T extends Json>(output?: T): T | undefined {
-        if (arguments.length > 0) {
-            this._output = output;
+    public output<T extends Json>(): T | undefined;
+    public output<T extends Json>(output: T): T | undefined;
+    public output<T extends Json>(path: string, value: T): void;
+    public output<T extends Json>(arg1?: any, arg2?: any): any {
+        if (arguments.length === 0) {
+            return this._output as T | undefined;
         }
+        if (arguments.length === 1) {
+            this._output = arg1;
         return this._output as T | undefined;
+        }
+        if (arguments.length === 2 && typeof arg1 === 'string') {
+            if (!this._output || typeof this._output !== 'object') {
+                this._output = {};
+            }
+            const path = arg1.split('.');
+            let obj = this._output as any;
+            for (let i = 0; i < path.length - 1; i++) {
+                if (typeof obj[path[i]] !== 'object' || obj[path[i]] === null) {
+                    obj[path[i]] = {};
+                }
+                obj = obj[path[i]];
+            }
+            obj[path[path.length - 1]] = arg2;
+        }
     }
 
     public clearOutput(): void {
@@ -98,6 +118,18 @@ export class StateObject implements StateContext {
                 params: item.params,
             }
         }
+    }
+
+    public spawn(sm: string, input: Json): string {
+        let id = `spawn-${sm}-${uuidv4().substring(0, 3)}`;
+        this.waitFor([{ id: id, type: 'spawn', params: { sm, input } }]);
+        return id;
+    }
+
+    public escalate(user: string, message: string, inputs: EscalationInput[]): string {
+        let id = `escalate-${user}-${uuidv4().substring(0, 3)}`;
+        this.waitFor([{ id: id, type: 'escalate', params: { user, message, inputs } }]);
+        return id;
     }
 
     public isWaitingFor(): string[] {
@@ -174,5 +206,9 @@ export class StateObject implements StateContext {
 
     static fromContext(ctx: StateContext): StateObject {
         return ctx as StateObject;
+    }
+
+    public getWaitingMap(): { [key: string]: WaitingContext } {
+        return this._waiting;
     }
 }

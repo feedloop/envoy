@@ -47,9 +47,9 @@ export class ToolAgent extends StateMachine {
                 tool: <string, tool name, must be one of the tools provided, dont add any prefix or suffix>,
                 args: <{...}, arguments>
             }]
-        }
+        } <--- SINGLE PLAN OBJECT
 
-        Respond with ONLY valid JSON, no extra text, comments, or formatting!!!
+        Respond with ONLY valid JSON only one plan object, no extra text, comments, or formatting!!!
         `)
         return userPrompt;
     }
@@ -95,6 +95,7 @@ export class ToolAgent extends StateMachine {
                             result: result
                         });
                     } catch (error) {
+                        console.error(error);
                         if (error instanceof LlmError) {
                             ctx.error(error.message);
                         }

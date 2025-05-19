@@ -144,6 +144,7 @@ export class OpenAIProvider implements LlmProvider {
             try {
                 data = JSON.parse(message.content || '{}');
             } catch (error) {
+                console.log(message.content);
                 throw new LlmError(`Failed to parse JSON content: ${error}`, "parse_error", "json_content");
             }
         } else if (cfg.mode === 'xml') {

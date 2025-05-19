@@ -54,12 +54,10 @@ export type StateContext = {
     isWaitingFor(): string[];
     set<T extends Json>(key: string, value: T): void;
     get<T extends Json>(key: string): T;
-    clone(): StateContext;
+    clone(newId?: boolean): StateContext;
     serialize(): SerializedState;
     [key: string]: any;
 }
-
-
 
 export type SerializedState = {
     state: string;
@@ -72,4 +70,8 @@ export type SerializedState = {
         [key: string]: WaitingContext
     };
     data: JsonObject;
+}
+
+export interface SchedulerOptions {
+    concurrency?: number;
 }

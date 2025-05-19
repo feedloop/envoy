@@ -1,6 +1,8 @@
+import { Json } from "../types";
 import { StateNode } from "./StateNode";
 import { StateObject } from "./StateObject";
 import { StateMachinePlugin, StateContext, StateDescriptor } from "./types";
+import { v4 as uuidv4 } from 'uuid';
 
 
 export type StateMachineOptions = {
@@ -153,12 +155,12 @@ export class StateMachine<T extends StateContext = StateContext> {
         return newCtx as unknown as T;
     }
 
-    public newContext(input: string): T {
+    public newContext(input: Json): T {
         let ctx = new StateObject(this._startState, 1, input);
         return ctx as unknown as T;
     }
 
-    public async run(input: string): Promise<T> {
+    public async run(input: Json): Promise<T> {
         let ctx = await this.newContext(input);
         while (!ctx.done()) {
             ctx = await this.step(ctx);

@@ -48,6 +48,8 @@ export class ToolAgent extends StateMachine {
                 args: <{...}, arguments>
             }]
         }
+
+        Respond with ONLY valid JSON, no extra text, comments, or formatting!!!
         `)
         return userPrompt;
     }
@@ -72,6 +74,7 @@ export class ToolAgent extends StateMachine {
                     ];
 
                     ctx.output(messages);
+                    
                     return ctx;
 
                 },
@@ -87,12 +90,10 @@ export class ToolAgent extends StateMachine {
                     let messages = ctx.input<LlmMessage[]>();
                     try {
                         let result = await this.provider.generate(messages, {mode: 'json', model: 'gpt-4.1-mini'});
-
                         ctx.output({
                             messages: messages,
                             result: result
                         });
-                        
                     } catch (error) {
                         if (error instanceof LlmError) {
                             ctx.error(error.message);
@@ -107,7 +108,6 @@ export class ToolAgent extends StateMachine {
                     },
                     router: async (ctx: StateContext) => {
                         let output = ctx.output<{ messages: LlmMessage[], result: LlmResponse }>();
-
                         if (output) {
                             let {messages, result} = output;
                             if (result.data) {

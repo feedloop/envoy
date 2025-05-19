@@ -37,6 +37,7 @@ export type LlmConfig = {
     mode?: "text" | "json" | "xml";
     apiKey?: string;
     tools?: LlmTool[];
+    temperature?: number; // LLM sampling temperature (default: 0)
     config?: {
         [key: string]: Json;
     }

@@ -70,6 +70,7 @@ export class OpenAIProvider implements LlmProvider {
             model: cfg.model,
             messages: openaiMessages,
             stream: false,
+            temperature: cfg.temperature ?? 0,
             ...this.config.config,
         };
 

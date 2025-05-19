@@ -1,5 +1,6 @@
 import { Json, JsonObject } from "../types";
 import { SerializedState, StateContext, WaitFor, WaitingContext } from "./types";
+import { v4 as uuidv4 } from 'uuid';
 
 export class StateObject implements StateContext {
 
@@ -139,7 +140,7 @@ export class StateObject implements StateContext {
         return this._data[key] as T;
     }
 
-    public clone(): StateObject {
+    public clone(newId = false): StateObject {
         let clone = new StateObject(this._state, this._step, this._input);
         clone._output = this._output;
         clone._waiting = {...this._waiting};
@@ -162,7 +163,7 @@ export class StateObject implements StateContext {
     }
 
     static from(json: SerializedState): StateObject {
-        let state = new StateObject(json.state as string, json.step as number, json.input as string);
+        let state = new StateObject(json.state, json.step, json.input);
         state._output = json.output;
         state._done = json.done;
         state._waiting = json.waiting;

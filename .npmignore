@@ -16,6 +16,9 @@ docker-compose.yml
 .git
 .gitignore
 .cursorignore
+just.config.js
+
+src
 
 # Ignore node_modules and lock files (npm will ignore node_modules by default)
 node_modules

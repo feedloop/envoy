@@ -1,7 +1,8 @@
 {
   "name": "@feedloop/envoy",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "test": "jest --runInBand",
     "build": "tsc",
@@ -9,8 +10,8 @@
     "migrate": "node scripts/migrate.js"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Ahmad Rizqi Meydiarso",
+  "license": "MIT",
   "description": "",
   "devDependencies": {
     "@types/jest": "^29.5.14",

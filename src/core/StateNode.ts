@@ -1,5 +1,6 @@
-import { RouteResult, StateContext, StateDescriptor, StateRouter } from "./types";
-import { StateMachine } from "./StateMachine";
+import { StateContext, StateDescriptor, StateRouter } from "./types";
+import { StateFlow } from "./StateFlow";
+import { Json } from "..";
 
 
 /**
@@ -13,10 +14,10 @@ export class StateNode {
     private _onExitHandler: (ctx: StateContext) => Promise<StateContext>;
     private _onStateHandler: (ctx: StateContext) => Promise<StateContext>;
 
-    constructor(readonly stateMachine: StateMachine, 
+    constructor(readonly flow: StateFlow, 
         readonly descriptor: StateDescriptor) {
         this.name = descriptor.name;
-        this.stateMachine = stateMachine;
+        this.flow = flow;
         this._router = descriptor.router;
         this._onEnterHandler = descriptor.onEnter || (async (state: StateContext) => state);
         this._onExitHandler = descriptor.onExit || (async (state: StateContext) => state);
@@ -25,7 +26,7 @@ export class StateNode {
 
     public async onEnter(ctx: StateContext): Promise<StateContext> {
         ctx = ctx.clone();
-        let plugins = this.stateMachine.plugins();
+        let plugins = this.flow.plugins();
         for (let plugin of plugins) {
             if (plugin.onEnter) {
                 ctx = await plugin.onEnter(ctx);
@@ -39,7 +40,7 @@ export class StateNode {
 
     public async onExit(ctx: StateContext): Promise<StateContext> {
         ctx = ctx.clone();
-        let plugins = this.stateMachine.plugins();
+        let plugins = this.flow.plugins();
         for (let plugin of plugins) {
             if (plugin.onExit) {
                 ctx = await plugin.onExit(ctx);
@@ -57,7 +58,7 @@ export class StateNode {
     }
 
     private _nextNode(): StateNode | null {
-        let nodes = this.stateMachine.nodes();
+        let nodes = this.flow.nodes();
         let index = nodes.indexOf(this);
         if (index === -1) {
             return null;
@@ -69,26 +70,48 @@ export class StateNode {
         return null;
     }
 
-    public async route(ctx: StateContext): Promise<RouteResult | null> {
-        let proposedNext: RouteResult | null = null;
+    public async mapOutput<T extends Json = Json>(ctx: StateContext, nextState: string): Promise<T> {
+        let output = ctx.output();
+        if (this._router) {
+            if ("next" in this._router) {
+                if (this._router.map) {
+                    return this._router.map(output, ctx);
+                }
+            } else if ("routes" in this._router) {
+                let route = this._router.routes[nextState];
+                if (typeof route === "function") {
+                    return route(output, ctx);
+                } else if (route.map) {
+                    return route.map(output, ctx);
+                }
+            }
+        }
+        return output as T;
+    }
+
+    public async route(ctx: StateContext): Promise<string | null> {
+        let proposedNext: string | null = null;
 
         if (!this._router) {
             const nextNode = this._nextNode();
-            proposedNext = nextNode ? {state: nextNode.name, input: ctx.output() ?? null} : null;
+            proposedNext = nextNode ? nextNode.name : null;
         } else if ("next" in this._router) {
             if (this._router.next === null) {
                 proposedNext = null;
             } else {
-                proposedNext = {state: this._router.next, input: ctx.output() ?? null};
+                proposedNext = this._router.next;
             }
         } else if ("routes" in this._router) {
             proposedNext = await this._router.onRoute(ctx);
+            if (!proposedNext || !this._router.routes[proposedNext]) {
+                proposedNext = null;
+            }
         }
 
         // Debug: print proposedNext before plugins
         
         // Plugin interception
-        for (const plugin of this.stateMachine.plugins()) {
+        for (const plugin of this.flow.plugins()) {
             if (plugin.onRoute) {
                 proposedNext = await plugin.onRoute(ctx, proposedNext);
             }
@@ -98,7 +121,7 @@ export class StateNode {
 
         // Return null if the proposed state does not exist in the state machine
         if (proposedNext) {
-            const node = this.stateMachine.node(proposedNext.state);
+            const node = this.flow.node(proposedNext);
             if (!node) {
                 
                 return null;
@@ -121,13 +144,13 @@ export class StateNode {
             if (this._router.next === null) {
                 return nodes;
             }
-            let nextNode = this.stateMachine.node(this._router.next);
+            let nextNode = this.flow.node(this._router.next);
             if (nextNode) {
                 nodes.push(nextNode);
             }
         } else if ("routes" in this._router) {
             for (let route of Object.keys(this._router.routes)) {
-                let node = this.stateMachine.node(route);
+                let node = this.flow.node(route);
                 if (node) {
                     nodes.push(node);
                 }

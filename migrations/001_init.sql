@@ -1,7 +1,7 @@
 -- Example initial migration
 CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY,
-    state_machine VARCHAR NOT NULL,
+    flow VARCHAR NOT NULL,
     status VARCHAR NOT NULL,
     context JSONB NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),

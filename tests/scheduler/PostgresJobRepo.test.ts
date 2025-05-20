@@ -35,7 +35,7 @@ describe('PostgresJobRepo', () => {
 
   const baseJob: JobSchema = {
     id: 'test_job',
-    stateMachine: 'test_machine',
+    flow: 'test_machine',
     status: 'pending' as JobStatus,
     context: {
       state: 'start',
@@ -60,7 +60,7 @@ describe('PostgresJobRepo', () => {
     const job = await repo.createJob(baseJob);
     const fetched = await repo.getJob(job.id);
     expect(fetched).toMatchObject({
-      stateMachine: baseJob.stateMachine,
+      flow: baseJob.flow,
       status: baseJob.status,
       context: baseJob.context,
     });
@@ -75,7 +75,7 @@ describe('PostgresJobRepo', () => {
 
   it('should get pending jobs', async () => {
     await repo.createJob(baseJob);
-    await repo.createJob({ ...baseJob, stateMachine: 'other' });
+    await repo.createJob({ ...baseJob, flow: 'other' });
     const pending = await repo.getPendingJobs(10);
     expect(pending.length).toBe(2);
     expect(pending[0].status).toBe('pending');

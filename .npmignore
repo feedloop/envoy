@@ -1,0 +1,35 @@
+# Ignore test files and directories
+/tests
+*.test.ts
+*.spec.ts
+
+# Ignore environment and config files
+.env
+.env.*
+*.local
+
+# Ignore Docker and CI files
+Dockerfile
+docker-compose.yml
+
+# Ignore version control and editor files
+.git
+.gitignore
+.cursorignore
+
+# Ignore node_modules and lock files (npm will ignore node_modules by default)
+node_modules
+package-lock.json
+
+# Ignore TypeScript build artifacts
+*.tsbuildinfo
+
+# Ignore other development artifacts
+coverage
+
+# Ignore database files
+data
+
+# Ignore README and docs if you don't want them published (optional)
+# README.md
+# docs/ 

@@ -17,12 +17,12 @@ Envoy is a modular, extensible workflow engine and job scheduler for AI use case
 ## 2. Architecture
 
 - **Scheduler:** Orchestrates job execution, manages queues, retries, and blocking.
-- **StateMachine:** Defines workflow logic as a series of states and transitions.
+- **Flow:** Defines workflow logic as a series of states and transitions.
 - **JobRepo:** Persists jobs and their state in PostgreSQL.
 - **Redis:** Used for distributed job queues, locks, and fast status checks.
 
 ```
-[Client/API] → [Scheduler] → [StateMachine] → [JobRepo (Postgres)]
+[Client/API] → [Scheduler] → [Flow] → [JobRepo (Postgres)]
                                  ↓
                               [Redis]
 ```
@@ -37,21 +37,19 @@ Envoy is a modular, extensible workflow engine and job scheduler for AI use case
 - Redis (6+)
 
 ### Installation
+In your project:
 ```sh
-npm install
+npm install @feedloop/envoy
 ```
 
-### Environment Variables
-Copy `.env.example` to `.env` and fill in your database and Redis connection details:
+### Flow Concept: Minimal Example
 
-### StateMachine Concept: Minimal Example
-
-A StateMachine is a workflow defined as a series of named states (nodes) and transitions. Each state can perform logic and decide what state to go to next.
+A Flow is a workflow defined as a series of named states (nodes) and transitions. Each state can perform logic and decide what state to go to next.
 
 ```ts
-import { StateMachine } from './src/core/StateMachine';
+import { StateFlow } from '@feedloop/envoy';
 
-const sm = new StateMachine([
+const flow = new StateFlow([
   {
     name: 'Start',
     onState: async ctx => {
@@ -78,10 +76,8 @@ const sm = new StateMachine([
   }
 ]);
 
-(async () => {
-  const ctx = await sm.run();
-  console.log(ctx.output()); // "Hello! Middle! End!"
-})();
+const ctx = await sm.run();
+console.log(ctx.output()); // "Hello! Middle! End!"
 ```
 
 ---
@@ -112,20 +108,28 @@ Use a `router` function to decide the next state based on context, output, or an
     return ctx;
   },
   router: {
+    // define the routes
+    routes: {
+      B: {
+        description: "route to B"
+      },
+      C: {
+        description: "route to C"
+      }
+    }
     onRoute: async ctx => {
       const value = ctx.output<number>();
       if (value > 0.5) {
-        return { state: 'B', input: value };
+        return 'B';
       } else {
-        return { state: 'C', input: value };
+        return 'C';
       }
     }
   }
 }
 ```
 
-- The router function can return `{ state: 'NextState', input: ... }` to pass input to the next state.
-- You can implement conditional branching, loops, or even end the workflow by returning `{ state: null }`.
+- You can implement conditional branching, loops, or even end the workflow by returning null.
 
 #### 3. Example: Conditional Branching
 
@@ -137,10 +141,14 @@ Use a `router` function to decide the next state based on context, output, or an
     return ctx;
   },
   router: {
+    routes: {
+      Big: o => o,
+      Small: o => o
+    }
     onRoute: async ctx => {
       return ctx.output<number>() > 10
-        ? { state: 'Big', input: ctx.output() }
-        : { state: 'Small', input: ctx.output() };
+        ? 'Big'
+        : 'Small'
     }
   }
 },
@@ -178,12 +186,28 @@ This allows you to build complex, data-driven workflows with flexible transition
 
 ---
 
-### The ctx Object: input, output, set, get
+### The ctx Object
+The `ctx` object (short for "context") is passed to every state handler and provides methods to access and manipulate the state machine's execution context. It allows you to:
 
-- `ctx.input<T>()`: Get the input for this state.
+- Access the current state's input and output.
+- Store and retrieve arbitrary data across states.
+- Control execution flow (e.g., spawn child jobs, escalate, wait for events).
+- Track progress, state name, and step count.
+
+Common `ctx` methods include:
+
+- `ctx.input<T>()`: Get the input for this state, optionally typed.
 - `ctx.output<T>(value?)`: Set or get the output for this state.
-- `ctx.set(key, value)`: Store arbitrary data in the context.
-- `ctx.get<T>(key)`: Retrieve stored data.
+- `ctx.set(key, value)`: Store custom data in the context.
+- `ctx.get<T>(key)`: Retrieve custom data from the context.
+- `ctx.state()`: Get the current state name.
+- `ctx.step()`: Get the current step number.
+- `ctx.done()`: Check if the workflow is finished or in a terminal state.
+- `ctx.spawn(workflowName, input)`: Spawn a child workflow/job.
+- `ctx.waitFor(waitList)`: Block until external input or events are received.
+- `ctx.escalate(user, message, inputs)`: Escalate to a human or external system for intervention.
+
+The `ctx` object is a new context instance, so always return the updated `ctx` from your handler. immutable by default—modifications return
 
 ```ts
 onState: async ctx => {
@@ -210,7 +234,7 @@ onState: async ctx => {
 
 ---
 
-### Plugins: Extending StateMachine Behavior
+### Plugins: Extending  Behavior
 
 Plugins allow you to extend or intercept state transitions, add logging, metrics, or custom logic:
 
@@ -221,41 +245,12 @@ const myPlugin = {
   onExit: (ctx, state) => { console.log('Exiting', state); }
 };
 
-const sm = new StateMachine([...], { plugins: [myPlugin] });
+const sm = new StateFlow([...], { plugins: [myPlugin] });
 ```
 - Plugins can hook into `onEnter`, `onExit`, and other lifecycle events.
 
----
 
-## 4. Database Setup & Migrations
-
-### Initialize the Database
-```sh
-npm run migrate
-```
-
-### Clean & Recreate Test Database
-```sh
-npm run migrate -- --clean
-```
-
----
-
-## 5. Running the Application
-
-### Local Development
-```sh
-npm run dev
-```
-
-### With Docker (if available)
-```sh
-docker-compose up --build
-```
-
----
-
-## 6. Job & Workflow Concepts
+## 4. Job & Workflow Concepts
 
 - **Job:** A unit of work tracked in the database, processed by a state machine.
 - **State Machine:** Defines the workflow logic for a job, with named states and transitions.
@@ -286,7 +281,30 @@ await scheduler.replyToEscalation(escalationId, { reason: 'a', note: 'OK' }, 'ap
 
 ---
 
-## 7. API Usage
+## 5. API Usage
+
+### Instantiate scheduler
+```ts
+// To quickly get started, use `initScheduler` to create a scheduler instance with a database and built-in workflows:
+
+import { initScheduler } from '@feedloop/envoy';
+
+const scheduler = await initScheduler({
+  redis: {
+    host: 'localhost',      // or your Redis host
+    port: 6379,             // optional, default 6379
+    password: 'yourpassword'// optional
+  },
+  postgres: {
+    host: 'localhost',      // or your Postgres host
+    port: 5432,             // optional, default 5432
+    password: 'postgres',   // optional
+    database: 'postgres'    // optional
+  },
+  concurrency: 2,           // optional, number of jobs to run in parallel
+  maxRetries: 3             // optional, max retries per job
+});
+```
 
 ### Scheduling a Job
 ```ts
@@ -310,27 +328,12 @@ await scheduler.failJob(jobId, 'reason');
 await scheduler.resolveBlockingJob(jobId, 'waitForId', { result: 42 });
 ```
 
----
-
-## 8. Testing
-
-### Run the Test Suite
-```sh
-npm test
-```
-
-- The test database is dropped and recreated before tests for isolation.
-- Tests cover job scheduling, parent/child workflows, blocking, retries, and orphaned job cleanup.
-
----
-
-## 9. Implementing a State Machine (Example: ToolAgent)
+## 6. Implementing a State Machine (Example: ToolAgent)
 
 You can implement custom state machines for your workflows. Here's an example using the built-in `ToolAgent`, which plans and executes tool calls using an LLM:
 
 ```ts
-import { ToolAgent } from './src/agents/ToolAgent';
-import { OpenAIProvider } from './src/llm/OpenAIProvider';
+import { ToolAgent, OpenAIProvider } from '@feedloop/envoy';
 
 // Define your tools
 const tools = [
@@ -357,22 +360,19 @@ const agent = new ToolAgent(provider, {
   maxSteps: 10,
 });
 
-// Run the agent with a task
-(async () => {
-  const ctx = await agent.run('What is 2 + 2?');
-  console.log('Final output:', ctx.output());
-})();
+const ctx = await agent.run('What is 2 + 2?');
+console.log('Final output:', ctx.output());
 ```
 
 - **Define tools** with a name, description, parameters, and handler function.
 - **Instantiate ToolAgent** with your tools and an LLM provider.
 - **Run the agent** with a user task; the agent will plan, call tools, and return the result.
 
-You can implement your own state machines by extending `StateMachine` and defining custom states and transitions for your workflow needs.
+You can implement your own state machines by extending `StateFlow` and defining custom states and transitions for your workflow needs.
 
 ---
 
-## 10. Contributing
+## 7. Contributing
 
 - Fork the repo and create a feature branch.
 - Write tests for new features or bug fixes.
@@ -380,13 +380,6 @@ You can implement your own state machines by extending `StateMachine` and defini
 
 ---
 
-## 11. License
+## 8. License
 
 MIT
-
----
-
-## 12. Acknowledgments
-
-- Inspired by workflow engines, distributed job systems, and state machine libraries.
-- Thanks to all contributors and open source libraries used in this project. 

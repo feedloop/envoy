@@ -1,11 +1,11 @@
 import { StateNode } from '../../src/core/StateNode';
-import { StateMachine } from '../../src/core/StateMachine';
+import { StateFlow } from '../../src/core/StateFlow';
 import { StateContext, StateDescriptor } from '../../src/core/types';
 import { StateObject } from '../../src/core/StateObject';
 
 describe('StateNode', () => {
     const dummyCtx = new StateObject('A', 1, null);
-    const makeMachine = () => new StateMachine([]);
+    const makeMachine = () => new StateFlow([]);
 
     it('constructs with correct name, and handlers', () => {
         const desc: StateDescriptor = {
@@ -38,7 +38,7 @@ describe('StateNode', () => {
             onEnter: async (ctx: StateContext) => { pluginCalls.push('pluginEnter'); return ctx; },
             onExit: async (ctx: StateContext) => { pluginCalls.push('pluginExit'); return ctx; },
         };
-        const machine = new StateMachine([], { plugins: [plugin] });
+        const machine = new StateFlow([], { plugins: [plugin] });
         const desc: StateDescriptor = {
             name: 'C',
             onEnter: async (ctx) => ctx,
@@ -52,18 +52,18 @@ describe('StateNode', () => {
     });
 
     it('routes to next node by default', async () => {
-        const machine = new StateMachine([]);
+        const machine = new StateFlow([]);
         const descA: StateDescriptor = { name: 'A', onState: async (ctx) => ctx };
         const descB: StateDescriptor = { name: 'B', onState: async (ctx) => ctx };
         const nodeA = new StateNode(machine, descA);
         const nodeB = new StateNode(machine, descB);
         (machine as any)._nodes = [nodeA, nodeB]; // recast for test
-        expect(await nodeA.route(dummyCtx)).toEqual({ state: 'B', input: null });
+        expect(await nodeA.route(dummyCtx)).toBe('B');
         expect(await nodeB.route(dummyCtx)).toBeNull();
     });
 
     it('routes using router.next', async () => {
-        const machine = new StateMachine([]);
+        const machine = new StateFlow([]);
         const descA: StateDescriptor = {
             name: 'A',
             router: { next: 'B' },
@@ -73,11 +73,11 @@ describe('StateNode', () => {
         const nodeA = new StateNode(machine, descA);
         const nodeB = new StateNode(machine, descB);
         (machine as any)._nodes = [nodeA, nodeB]; // recast for test
-        expect(await nodeA.route(dummyCtx)).toEqual({ state: 'B', input: null });
+        expect(await nodeA.route(dummyCtx)).toBe('B');
     });
 
     it('routes using router.routes', async () => {
-        const machine = new StateMachine([]);
+        const machine = new StateFlow([]);
         const descA: StateDescriptor = {
             name: 'A',
             router: {
@@ -85,7 +85,7 @@ describe('StateNode', () => {
                     B: { description: 'to B' },
                     C: { description: 'to C' }
                 },
-                onRoute: async (ctx) => {return {state: 'C', input: null}},
+                onRoute: async (ctx) => 'C',
             },
             onState: async (ctx) => ctx
         };
@@ -95,11 +95,11 @@ describe('StateNode', () => {
         const nodeB = new StateNode(machine, descB);
         const nodeC = new StateNode(machine, descC);
         (machine as any)._nodes = [nodeA, nodeB, nodeC]; // recast for test
-        expect(await nodeA.route(dummyCtx)).toEqual({ state: 'C', input: null });
+        expect(await nodeA.route(dummyCtx)).toBe('C');
     });
 
     it('nextNodes returns correct nodes', () => {
-        const machine = new StateMachine([]);
+        const machine = new StateFlow([]);
         const descA: StateDescriptor = {
             name: 'A',
             router: { next: 'B' },
@@ -132,7 +132,7 @@ describe('StateNode', () => {
             onEnter: async () => { throw new Error('plugin enter'); },
             onExit: async () => { throw new Error('plugin exit'); },
         };
-        const machine = new StateMachine([], { plugins: [plugin] });
+        const machine = new StateFlow([], { plugins: [plugin] });
         const desc: StateDescriptor = {
             name: 'P',
             onEnter: async (ctx) => ctx,
@@ -145,12 +145,12 @@ describe('StateNode', () => {
     });
 
     it('router returns non-existent state, null, or undefined', async () => {
-        const machine = new StateMachine([]);
+        const machine = new StateFlow([]);
         const desc: StateDescriptor = {
             name: 'A',
             router: {
                 next: 'B',
-                onRoute: async () => {return {state: 'Z', input: null}}, // Z does not exist
+                onRoute: async () => 'Z', // Z does not exist
             },
             onState: async (ctx) => ctx
         };
@@ -173,5 +173,127 @@ describe('StateNode', () => {
         await expect(node.onEnter(dummyCtx)).resolves.toEqual(dummyCtx);
         await expect(node.onState(dummyCtx)).resolves.toEqual(dummyCtx);
         await expect(node.onExit(dummyCtx)).resolves.toEqual(dummyCtx);
+    });
+
+    it('maps output using router.map', async () => {
+        const machine = new StateFlow([]);
+        const descA: StateDescriptor = {
+            name: 'A',
+            router: {
+                next: 'B',
+                map: (output, ctx) => {
+                    // Example: just return output doubled if it's a number
+                    if (typeof output === 'number') return (output * 2) as any;
+                    return output;
+                }
+            },
+            onState: async (ctx) => { ctx.output(21); return ctx; }
+        };
+        const descB: StateDescriptor = { name: 'B', onState: async (ctx) => ctx };
+        const nodeA = new StateNode(machine, descA);
+        const nodeB = new StateNode(machine, descB);
+        (machine as any)._nodes = [nodeA, nodeB];
+        const ctx = new StateObject('A', 1, null);
+        ctx.output(21);
+        const mapped = await nodeA.mapOutput(ctx, 'B');
+        expect(mapped).toBe(42);
+    });
+
+    it('maps output using router.next + map', async () => {
+        const machine = new StateFlow([]);
+        const descA: StateDescriptor = {
+            name: 'A',
+            router: {
+                next: 'B',
+                map: (output, ctx) => {
+                    if (typeof output === 'number') return (output + 1) as any;
+                    return output;
+                }
+            },
+            onState: async (ctx) => { ctx.output(10); return ctx; }
+        };
+        const descB: StateDescriptor = { name: 'B', onState: async (ctx) => ctx };
+        const nodeA = new StateNode(machine, descA);
+        const nodeB = new StateNode(machine, descB);
+        (machine as any)._nodes = [nodeA, nodeB];
+        const ctx = new StateObject('A', 1, null);
+        ctx.output(10);
+        const mapped = await nodeA.mapOutput(ctx, 'B');
+        expect(mapped).toBe(11);
+    });
+
+    it('maps output using router.routes with function', async () => {
+        const machine = new StateFlow([]);
+        const descA: StateDescriptor = {
+            name: 'A',
+            router: {
+                routes: {
+                    B: (output, ctx) => {
+                        if (typeof output === 'number') return (output * 3) as any;
+                        return output;
+                    }
+                },
+                onRoute: async (ctx) => 'B',
+            },
+            onState: async (ctx) => { ctx.output(5); return ctx; }
+        };
+        const descB: StateDescriptor = { name: 'B', onState: async (ctx) => ctx };
+        const nodeA = new StateNode(machine, descA);
+        const nodeB = new StateNode(machine, descB);
+        (machine as any)._nodes = [nodeA, nodeB];
+        const ctx = new StateObject('A', 1, null);
+        ctx.output(5);
+        const mapped = await nodeA.mapOutput(ctx, 'B');
+        expect(mapped).toBe(15);
+    });
+
+    it('maps output using router.routes with object + map', async () => {
+        const machine = new StateFlow([]);
+        const descA: StateDescriptor = {
+            name: 'A',
+            router: {
+                routes: {
+                    B: {
+                        description: 'to B',
+                        map: (output, ctx) => {
+                            if (typeof output === 'number') return (output - 2) as any;
+                            return output;
+                        }
+                    }
+                },
+                onRoute: async (ctx) => 'B',
+            },
+            onState: async (ctx) => { ctx.output(8); return ctx; }
+        };
+        const descB: StateDescriptor = { name: 'B', onState: async (ctx) => ctx };
+        const nodeA = new StateNode(machine, descA);
+        const nodeB = new StateNode(machine, descB);
+        (machine as any)._nodes = [nodeA, nodeB];
+        const ctx = new StateObject('A', 1, null);
+        ctx.output(8);
+        const mapped = await nodeA.mapOutput(ctx, 'B');
+        expect(mapped).toBe(6);
+    });
+
+    it('returns raw output if no map is defined for route', async () => {
+        const machine = new StateFlow([]);
+        const descA: StateDescriptor = {
+            name: 'A',
+            router: {
+                routes: {
+                    B: { description: 'to B' }
+                },
+                onRoute: async (ctx) => 'B',
+            },
+            onState: async (ctx) => { ctx.output(99); return ctx; }
+        };
+        const descB: StateDescriptor = { name: 'B', onState: async (ctx) => ctx };
+        const nodeA = new StateNode(machine, descA);
+        const nodeB = new StateNode(machine, descB);
+        (machine as any)._nodes = [nodeA, nodeB];
+        const ctx = new StateObject('A', 1, null);
+        ctx.output(99);
+        const mapped = await nodeA.mapOutput(ctx, 'B');
+        expect(mapped).toBe(99);
     });
 }); 

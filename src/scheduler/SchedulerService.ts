@@ -1,4 +1,4 @@
-import { StateMachine } from "../core/StateMachine";
+import { StateFlow } from "../core/StateFlow";
 import { JobRepo, JobSchema, EscalationRepo, EscalationStatus, EscalationReply, JobStatus } from "./types";
 import { Json } from "../types";
 import { Redis } from "ioredis";
@@ -11,8 +11,8 @@ interface SchedulerOptions {
     maxRetries?: number;
 }
 
-export class Scheduler {
-    private _stateMachines: Record<string, StateMachine> = {};
+export class SchedulerService {
+    private _flows: Record<string, StateFlow> = {};
     private _workerId: string;
     private _concurrency: number;
     private _executionLoopTimer?: NodeJS.Timeout;
@@ -33,21 +33,21 @@ export class Scheduler {
         this._escalationRepo = escalationRepo;
     }
 
-    public stateMachine(name: string): StateMachine {
-        if (!this._stateMachines[name]) {
+    public flow(name: string): StateFlow {
+        if (!this._flows[name]) {
             throw new Error(`State machine '${name}' not found`);
         }
-        return this._stateMachines[name];
+        return this._flows[name];
     }
 
-    public addStateMachine(name: string, stateMachine: StateMachine): void {
-        this._stateMachines[name] = stateMachine;
+    public addFlow(name: string, flow: StateFlow): void {
+        this._flows[name] = flow;
     }
 
     public async schedule(name: string, input: Json): Promise<Json> {
-        let context = this.stateMachine(name).newContext(input);
+        let context = this.flow(name).newContext(input);
         let job = await this._jobRepo.createJob({
-            stateMachine: name,
+            flow: name,
             status: "pending",
             context: context.serialize(),
             retries: 0,
@@ -99,7 +99,7 @@ export class Scheduler {
 
             // 6. Try to step the state machine and handle errors
             try {
-                const sm = this.stateMachine(runningJob.stateMachine);
+                const sm = this.flow(runningJob.flow);
                 let ctx = StateObject.from(runningJob.context as SerializedState);
                 ctx = await sm.step(ctx) as StateObject; // If this throws, catch below
                 // Handle spawn jobs
@@ -109,9 +109,9 @@ export class Scheduler {
                     if (wait.type === 'spawn' && wait.status === 'pending' && !wait.childJobId && wait.params && typeof wait.params.sm === 'string') {
                         // Create child job
                         const childJob = await this._jobRepo.createJob({
-                            stateMachine: wait.params.sm,
+                            flow: wait.params.sm,
                             status: 'pending',
-                            context: this.stateMachine(wait.params.sm).newContext(wait.params.input).serialize(),
+                            context: this.flow(wait.params.sm).newContext(wait.params.input).serialize(),
                             parent_id: job.id,
                             retries: 0,
                         });
@@ -165,7 +165,7 @@ export class Scheduler {
                 // Compose a JobSchema from Redis data (may be partial)
                 return {
                     id: jobId,
-                    stateMachine: jobData.stateMachine,
+                    flow: jobData.flow,
                     status: jobData.status,
                     context: jobData.context,
                     createdAt: jobData.createdAt ?? null,
@@ -337,7 +337,7 @@ export class Scheduler {
                 }
                 let ctx = StateObject.from(jobData.context);
                 // Step the state machine
-                const sm = this.stateMachine(jobData.stateMachine);
+                const sm = this.flow(jobData.flow);
                 const newCtx = await sm.step(ctx);
                 // Update context in Redis
                 jobData.context = newCtx.serialize();

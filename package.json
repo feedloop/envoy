@@ -1,6 +1,6 @@
 {
-  "name": "envoy",
-  "version": "1.0.0",
+  "name": "@feedloop/envoy",
+  "version": "0.1.4",
   "main": "dist/index.js",
   "scripts": {
     "test": "jest --runInBand",

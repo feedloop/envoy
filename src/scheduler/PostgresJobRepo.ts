@@ -8,31 +8,12 @@ export class PostgresJobRepo implements JobRepo {
         this.pool = pool;
     }
 
-    // Helper to initialize the jobs table
-    public async initTable(): Promise<void> {
-        await this.pool.query(`
-            CREATE TABLE IF NOT EXISTS jobs (
-                id UUID PRIMARY KEY,
-                state_machine VARCHAR NOT NULL,
-                status VARCHAR NOT NULL,
-                context JSONB NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                started_at TIMESTAMP,
-                finished_at TIMESTAMP,
-                error TEXT,
-                parent_id UUID NULL,
-                retries INT NOT NULL DEFAULT 0
-            );
-        `);
-    }
-
     public async createJob(job: Omit<JobSchema, "id" | "createdAt" | "updatedAt">): Promise<JobSchema> {
         const res = await this.pool.query(
-            `INSERT INTO jobs (id, state_machine, status, context, created_at, updated_at, started_at, finished_at, error, parent_id, retries)
+            `INSERT INTO jobs (id, flow, status, context, created_at, updated_at, started_at, finished_at, error, parent_id, retries)
              VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW(), $4, $5, $6, $7, $8)
              RETURNING *`,
-            [job.stateMachine, job.status, JSON.stringify(job.context), job.startedAt ?? null, job.finishedAt ?? null, job.error ?? null, job.parent_id ?? null, (job as any).retries ?? 0]
+            [job.flow, job.status, JSON.stringify(job.context), job.startedAt ?? null, job.finishedAt ?? null, job.error ?? null, job.parent_id ?? null, (job as any).retries ?? 0]
         );
         return this.rowToJob(res.rows[0]);
     }
@@ -100,7 +81,7 @@ export class PostgresJobRepo implements JobRepo {
     private rowToJob(row: any): JobSchema {
         return {
             id: row.id,
-            stateMachine: row.state_machine,
+            flow: row.flow,
             status: row.status,
             context: row.context,
             createdAt: row.created_at,

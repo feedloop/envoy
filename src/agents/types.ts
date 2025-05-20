@@ -1,4 +1,4 @@
-import { StateMachinePlugin, StateContext } from '../core/types';
+import { StateFlowPlugin, StateContext } from '../core/types';
 import { LlmTool } from '../llm/types';
 import { JsonObject } from '../types';
 
@@ -26,7 +26,7 @@ export type AgentPlanResult = {
 
 export type AgentOptions = {
     tools?: AgentTool[];
-    plugins?: StateMachinePlugin[];
+    plugins?: StateFlowPlugin[];
     planPrompt?: string;
     model?: string;
     maxSteps?: number;

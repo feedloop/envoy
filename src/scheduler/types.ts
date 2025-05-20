@@ -5,7 +5,7 @@ export type JobStatus = "pending" | "running" | "done" | "failed" | "cancelled" 
 
 export interface JobSchema {
     id: string;
-    stateMachine: string;
+    flow: string;
     status: JobStatus;
     context: SerializedState;
     createdAt: Date;
@@ -49,3 +49,19 @@ export interface EscalationRepo {
 }
 
 export type EscalationReply = { [inputId: string]: Json  };
+
+export type SchedulerConfig = {
+    redis?: {
+        host?: string;
+        port?: number;
+        password?: string;
+    }
+    postgres?: {
+        host?: string;
+        port?: number;
+        password?: string;
+        database?: string;
+    }
+    concurrency?: number;
+    maxRetries?: number;
+}

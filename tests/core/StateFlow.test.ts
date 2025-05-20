@@ -1,13 +1,13 @@
-import { StateMachine } from '../../src/core/StateMachine';
+import { StateFlow } from '../../src/core/StateFlow';
 import { StateNode } from '../../src/core/StateNode';
 import { StateObject } from '../../src/core/StateObject';
-import { StateDescriptor, StateContext, RouteResult } from '../../src/core/types';
+import { StateDescriptor, StateContext } from '../../src/core/types';
 
-describe('StateMachine', () => {
+describe('Flow', () => {
     const makeCtx = () => ({ clone: () => makeCtx() } as unknown as StateContext);
 
-    const makeNodes = (descs: StateDescriptor[], machine?: StateMachine) =>
-        descs.map(desc => new StateNode(machine || ({} as StateMachine), desc));
+    const makeNodes = (descs: StateDescriptor[], machine?: StateFlow) =>
+        descs.map(desc => new StateNode(machine || ({} as StateFlow), desc));
 
     it('can be instantiated with StateNode[]', () => {
         const descs: StateDescriptor[] = [
@@ -15,7 +15,7 @@ describe('StateMachine', () => {
             { name: 'B', onState: async (ctx) => ctx },
         ];
         const nodes = makeNodes(descs);
-        expect(() => new StateMachine(nodes)).not.toThrow();
+        expect(() => new StateFlow(nodes)).not.toThrow();
     });
 
     it('transitions between states (basic run)', async () => {
@@ -24,7 +24,7 @@ describe('StateMachine', () => {
             { name: 'A', onState: async (ctx) => { calls.push('A'); return ctx; }, router: { next: 'B' } },
             { name: 'B', onState: async (ctx) => { calls.push('B'); return ctx; } },
         ];
-        const sm = new StateMachine(descs);
+        const sm = new StateFlow(descs);
         if (typeof sm.run === 'function') {
             // Try to run from node A; pass state name as string
             try {
@@ -39,7 +39,7 @@ describe('StateMachine', () => {
     });
 
     it('handles empty state machine', () => {
-        expect(() => new StateMachine([])).not.toThrow();
+        expect(() => new StateFlow([])).not.toThrow();
     });
 
     it('calls plugin onEnter/onExit hooks in order for each state', async () => {
@@ -53,7 +53,7 @@ describe('StateMachine', () => {
             { name: 'A', onState: async (ctx) => ctx, router: { next: 'B' } },
             { name: 'B', onState: async (ctx) => ctx },
         ];
-        const sm = new StateMachine(descs, { plugins: [plugin], startState: 'A' });
+        const sm = new StateFlow(descs, { plugins: [plugin], startState: 'A' });
         await sm.run('test input');
         expect(calls).toEqual([
             'enter', 'exit', 'enter', 'exit'
@@ -69,7 +69,7 @@ describe('StateMachine', () => {
         const descs: StateDescriptor[] = [
             { name: 'A', onState: async (ctx) => ctx },
         ];
-        const sm = new StateMachine(descs, { plugins: [plugin], startState: 'A' });
+        const sm = new StateFlow(descs, { plugins: [plugin], startState: 'A' });
         await expect(sm.run('test input')).rejects.toThrow('plugin enter');
     });
 
@@ -82,13 +82,13 @@ describe('StateMachine', () => {
                     const val = ctx.get('goToC');
                     // eslint-disable-next-line no-console
                     
-                    return val ? {state: 'C', input: null} : {state: 'D', input: null}  ;
+                    return val ? 'C' : 'D';
                 },
             } },
             { name: 'C', onState: async (ctx) => { ctx.set('final', 'C'); return ctx; }, router: { next: null } },
             { name: 'D', onState: async (ctx) => { ctx.set('final', 'D'); return ctx; }, router: { next: null } },
         ];
-        let sm = new StateMachine(descs, { startState: 'A' });
+        let sm = new StateFlow(descs, { startState: 'A' });
         let ctx = new StateObject('A', 1, 'input');
         ctx.set('goToC', true);
         while (!ctx.done()) {
@@ -99,7 +99,7 @@ describe('StateMachine', () => {
         }
         
         expect(ctx.get('final')).toBe('C');
-        sm = new StateMachine(descs, { startState: 'A' });
+        sm = new StateFlow(descs, { startState: 'A' });
         ctx = new StateObject('A', 1, 'input');
         ctx.set('goToC', false);
         while (!ctx.done()) {
@@ -118,7 +118,7 @@ describe('StateMachine', () => {
             { name: 'A', onEnter: async (ctx: StateContext) => ctx },
             { name: 'B', dependsOn: ['A'], onEnter: async (ctx: StateContext) => ctx },
         ];
-        const sm = new StateMachine([], { plugins });
+        const sm = new StateFlow([], { plugins });
         expect(sm.plugins().map(p => p.name)).toEqual(['A', 'B', 'C']);
     });
 
@@ -127,7 +127,7 @@ describe('StateMachine', () => {
             { name: 'A', onEnter: async (ctx: StateContext) => ctx },
             { name: 'B', dependsOn: ['X'], onEnter: async (ctx: StateContext) => ctx },
         ];
-        expect(() => new StateMachine([], { plugins })).toThrow(/depends on missing plugin 'X'/);
+        expect(() => new StateFlow([], { plugins })).toThrow(/depends on missing plugin 'X'/);
     });
 
     it('throws on circular plugin dependency', () => {
@@ -135,11 +135,11 @@ describe('StateMachine', () => {
             { name: 'A', dependsOn: ['B'], onEnter: async (ctx: StateContext) => ctx },
             { name: 'B', dependsOn: ['A'], onEnter: async (ctx: StateContext) => ctx },
         ];
-        expect(() => new StateMachine([], { plugins })).toThrow(/Circular plugin dependency/);
+        expect(() => new StateFlow([], { plugins })).toThrow(/Circular plugin dependency/);
     });
 
     it('addPlugin throws if dependencies are not met', () => {
-        const sm = new StateMachine([]);
+        const sm = new StateFlow([]);
         sm.addPlugin({ name: 'A', onEnter: async (ctx: StateContext) => ctx });
         expect(() => sm.addPlugin({ name: 'B', dependsOn: ['X'], onEnter: async (ctx: StateContext) => ctx })).toThrow(/depends on missing plugin 'X'/);
     });
@@ -152,12 +152,12 @@ describe('StateMachine', () => {
         ];
         const plugin = {
             name: 'routeOverride',
-            onRoute: async (ctx: StateContext, proposedNext: RouteResult | null) => {
-                if (ctx.state() === 'B') return { state: 'C', input: null };
+            onRoute: async (ctx: StateContext, proposedNext: string | null) => {
+                if (ctx.state() === 'B') return 'C';
                 return proposedNext;
             }
         };
-        const sm = new StateMachine(descs, { plugins: [plugin], startState: 'A' });
+        const sm = new StateFlow(descs, { plugins: [plugin], startState: 'A' });
         let ctx = new StateObject('A', 1, 'input');
         while (!ctx.done()) {
             
@@ -175,9 +175,9 @@ describe('StateMachine', () => {
         ];
         const plugin = {
             name: 'noopRoute',
-            onRoute: async (_ctx: StateContext, proposedNext: import('../../src/core/types').RouteResult | null) => proposedNext
+            onRoute: async (_ctx: StateContext, proposedNext: string | null) => proposedNext
         };
-        const sm = new StateMachine(descs, { plugins: [plugin], startState: 'A' });
+        const sm = new StateFlow(descs, { plugins: [plugin], startState: 'A' });
         let ctx = new StateObject('A', 1, 'input');
         while (!ctx.done()) {
             
@@ -193,7 +193,7 @@ describe('StateMachine', () => {
             { name: 'B', onState: async (ctx) => { ctx.waitFor([{ id: 'foo', type: 'foo' }]); return ctx; }, router: { next: 'C' } },
             { name: 'C', onState: async (ctx) => { ctx.set('final', 'C'); return ctx; } },
         ];
-        const sm = new StateMachine(descs, { startState: 'A' });
+        const sm = new StateFlow(descs, { startState: 'A' });
         let ctx = new StateObject('A', 1, 'input');
         // Step into B
         while (ctx.state() !== 'B') {
@@ -222,7 +222,7 @@ describe('StateMachine', () => {
             { name: 'Middle', onState: async (ctx) => { return ctx; }, router: { next: 'End' } },
             { name: 'End', onState: async (ctx) => { ctx.set('done', true); return ctx; } },
         ];
-        const sm = new StateMachine(descs, { startState: 'Start' });
+        const sm = new StateFlow(descs, { startState: 'Start' });
         let ctx = new StateObject('Start', 1, 'input');
 
         // Step through Start -> Middle
@@ -247,5 +247,121 @@ describe('StateMachine', () => {
         expect(ctx2.state()).toBe('End');
         expect(ctx2.step()).toBe(3);
         expect(ctx2.get('done')).toBe(true);
+    });
+
+    it('maps output using router.next + map in flow', async () => {
+        const descs: StateDescriptor[] = [
+            {
+                name: 'A',
+                onState: async (ctx) => { ctx.output(10); return ctx; },
+                router: {
+                    next: 'B',
+                    map: (output, ctx) => typeof output === 'number' ? output + 1 : output
+                }
+            },
+            {
+                name: 'B',
+                onState: async (ctx) => ctx
+            }
+        ];
+        const sm = new StateFlow(descs, { startState: 'A' });
+        let ctx = new StateObject('A', 1, null);
+        ctx = await sm.step(ctx) as StateObject;
+        expect(ctx.input()).toBe(11);
+    });
+
+    it('maps output using router.routes with function in flow', async () => {
+        const descs: StateDescriptor[] = [
+            {
+                name: 'A',
+                onState: async (ctx) => { ctx.output(5); return ctx; },
+                router: {
+                    routes: {
+                        B: (output, ctx) => typeof output === 'number' ? output * 3 : output
+                    },
+                    onRoute: async (ctx) => 'B',
+                }
+            },
+            {
+                name: 'B',
+                onState: async (ctx) => ctx
+            }
+        ];
+        const sm = new StateFlow(descs, { startState: 'A' });
+        let ctx = new StateObject('A', 1, null);
+        ctx = await sm.step(ctx) as StateObject;
+        expect(ctx.input()).toBe(15);
+    });
+
+    it('maps output using router.routes with object + map in flow', async () => {
+        const descs: StateDescriptor[] = [
+            {
+                name: 'A',
+                onState: async (ctx) => { ctx.output(8); return ctx; },
+                router: {
+                    routes: {
+                        B: {
+                            description: 'to B',
+                            map: (output, ctx) => typeof output === 'number' ? output - 2 : output
+                        }
+                    },
+                    onRoute: async (ctx) => 'B',
+                }
+            },
+            {
+                name: 'B',
+                onState: async (ctx) => ctx
+            }
+        ];
+        const sm = new StateFlow(descs, { startState: 'A' });
+        let ctx = new StateObject('A', 1, null);
+        ctx = await sm.step(ctx) as StateObject;
+        expect(ctx.input()).toBe(6);
+    });
+
+    it('returns raw output if no map is defined for route in flow', async () => {
+        const descs: StateDescriptor[] = [
+            {
+                name: 'A',
+                onState: async (ctx) => { ctx.output(99); return ctx; },
+                router: {
+                    routes: {
+                        B: { description: 'to B' }
+                    },
+                    onRoute: async (ctx) => 'B',
+                }
+            },
+            {
+                name: 'B',
+                onState: async (ctx) => ctx
+            }
+        ];
+        const sm = new StateFlow(descs, { startState: 'A' });
+        let ctx = new StateObject('A', 1, null);
+        ctx = await sm.step(ctx) as StateObject;
+        expect(ctx.input()).toBe(99);
+    });
+
+    it('applies output mapping during stepping and passes mapped value as input to next state', async () => {
+        let receivedInput: any = null;
+        const descs: StateDescriptor[] = [
+            {
+                name: 'A',
+                onState: async (ctx) => { ctx.output(10); return ctx; },
+                router: {
+                    next: 'B',
+                    map: (output, ctx) => typeof output === 'number' ? output + 1 : output
+                }
+            },
+            {
+                name: 'B',
+                onState: async (ctx) => { receivedInput = ctx.input(); return ctx; }
+            }
+        ];
+        const sm = new StateFlow(descs, { startState: 'A' });
+        let ctx = new StateObject('A', 1, null);
+        ctx = await sm.step(ctx) as StateObject; // Step from A to B
+        ctx = await sm.step(ctx) as StateObject; // Step B
+        expect(receivedInput).toBe(11);
     });
 }); 

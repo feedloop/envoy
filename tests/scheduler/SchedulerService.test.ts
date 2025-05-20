@@ -5,12 +5,12 @@ import { Pool } from 'pg';
 import Redis from 'ioredis';
 import { runMigrations } from '../../scripts/migrate';
 import { PostgresJobRepo } from '../../src/scheduler/PostgresJobRepo';
-import { Scheduler } from '../../src/scheduler/Scheduler';
-import { StateMachine } from '../../src/core/StateMachine';
+import { SchedulerService } from '../../src/scheduler/SchedulerService';
+import { StateFlow } from '../../src/core/StateFlow';
 import { StateObject } from '../../src/core/StateObject';
 import { PostgresEscalationRepo } from '../../src/scheduler/PostgresEscalationRepo';
 
-const testStateMachine = new StateMachine([
+const testFlow = new StateFlow([
   {
     name: 'start',
     onState: async ctx => ctx,
@@ -26,7 +26,7 @@ describe('Scheduler (integration)', () => {
   let pool: Pool;
   let repo: PostgresJobRepo;
   let redis: Redis;
-  let scheduler: Scheduler;
+  let scheduler: SchedulerService;
 
   const dbConfig = {
     host: process.env.PGHOST!,
@@ -48,8 +48,8 @@ describe('Scheduler (integration)', () => {
       password: process.env.REDIS_PASSWORD || undefined,
       db: 0,
     });
-    scheduler = new Scheduler(repo, redis, { maxRetries: 0 });
-    scheduler.addStateMachine('test', testStateMachine);
+    scheduler = new SchedulerService(repo, redis, { maxRetries: 0 });
+    scheduler.addFlow('test', testFlow);
   });
 
   afterAll(async () => {
@@ -72,7 +72,7 @@ describe('Scheduler (integration)', () => {
     expect(typeof jobId).toBe('string');
     const jobIdStr = jobId as string;
     const job = await scheduler.getJob(jobIdStr);
-    expect(job.stateMachine).toBe('test');
+    expect(job.flow).toBe('test');
     expect(job.status).toBe('pending');
   });
 
@@ -200,8 +200,8 @@ describe('Scheduler (integration)', () => {
    */
   it('should only pick up as many jobs as concurrency allows', async () => {
     // Set concurrency to 2
-    scheduler = new Scheduler(repo, redis, { concurrency: 2 });
-    scheduler.addStateMachine('test', testStateMachine);
+    scheduler = new SchedulerService(repo, redis, { concurrency: 2 });
+    scheduler.addFlow('test', testFlow);
     const jobIds = await Promise.all([
       scheduler.schedule('test', { foo: 1 }),
       scheduler.schedule('test', { foo: 2 }),
@@ -220,11 +220,11 @@ describe('Scheduler (integration)', () => {
   });
 
   /**
-   * Test: StateMachine Error Handling
+   * Test: Flow Error Handling
    */
   it('should mark job as failed if state machine throws', async () => {
     // Error-throwing state machine
-    const errorStateMachine = new StateMachine([
+    const errorFlow = new StateFlow([
       {
         name: 'start',
         onState: async () => { throw new Error('fail!'); },
@@ -237,8 +237,8 @@ describe('Scheduler (integration)', () => {
     ]);
     // Use a scheduler with maxRetries = 3
     const maxRetries = 3;
-    scheduler = new Scheduler(repo, redis, { maxRetries });
-    scheduler.addStateMachine('error', errorStateMachine);
+    scheduler = new SchedulerService(repo, redis, { maxRetries });
+    scheduler.addFlow('error', errorFlow);
     const jobId = await scheduler.schedule('error', { foo: 'bar' });
     expect(typeof jobId).toBe('string');
     const jobIdStr = jobId as string;
@@ -266,8 +266,8 @@ describe('Scheduler (integration)', () => {
    * Test: startExecutionLoop (basic)
    */
   it('should process jobs via startExecutionLoop', async () => {
-    scheduler = new Scheduler(repo, redis, { concurrency: 1 });
-    scheduler.addStateMachine('test', testStateMachine);
+    scheduler = new SchedulerService(repo, redis, { concurrency: 1 });
+    scheduler.addFlow('test', testFlow);
     const jobId = await scheduler.schedule('test', { foo: 'bar' });
     expect(typeof jobId).toBe('string');
     const jobIdStr = jobId as string;
@@ -280,7 +280,7 @@ describe('Scheduler (integration)', () => {
 
   it('retries a job up to maxRetries and then fails', async () => {
     // State machine that always throws
-    const alwaysFailSM = new StateMachine([
+    const alwaysFailSM = new StateFlow([
       {
         name: 'start',
         onState: async () => { throw new Error('fail!'); },
@@ -289,8 +289,8 @@ describe('Scheduler (integration)', () => {
     ]);
     // Use a scheduler with maxRetries = 2
     const maxRetries = 2;
-    const retryScheduler = new Scheduler(repo, redis, { maxRetries });
-    retryScheduler.addStateMachine('alwaysFail', alwaysFailSM);
+    const retryScheduler = new SchedulerService(repo, redis, { maxRetries });
+    retryScheduler.addFlow('alwaysFail', alwaysFailSM);
 
     const jobId = await retryScheduler.schedule('alwaysFail', { foo: 'bar' }) as string;
     // Run enough times to exceed maxRetries
@@ -307,7 +307,7 @@ describe('Scheduler blocking jobs', () => {
   let pool: Pool;
   let repo: PostgresJobRepo;
   let redis: Redis;
-  let scheduler: Scheduler;
+  let scheduler: SchedulerService;
 
   // Use the same dbConfig as above
   const dbConfig = {
@@ -320,7 +320,7 @@ describe('Scheduler blocking jobs', () => {
   };
 
   // State machine that always waits for 'wait1'
-  const blockingStateMachine = new StateMachine([
+  const blockingFlow = new StateFlow([
     {
       name: 'start',
       onState: async ctx => {
@@ -333,7 +333,7 @@ describe('Scheduler blocking jobs', () => {
   ]);
 
   // State machine that waits for two IDs
-  const multiWaitStateMachine = new StateMachine([
+  const multiWaitFlow = new StateFlow([
     {
       name: 'start',
       onState: async ctx => {
@@ -357,9 +357,9 @@ describe('Scheduler blocking jobs', () => {
       password: process.env.REDIS_PASSWORD || undefined,
       db: 0,
     });
-    scheduler = new Scheduler(repo, redis);
-    scheduler.addStateMachine('blocking', blockingStateMachine);
-    scheduler.addStateMachine('multiwait', multiWaitStateMachine);
+    scheduler = new SchedulerService(repo, redis);
+    scheduler.addFlow('blocking', blockingFlow);
+    scheduler.addFlow('multiwait', multiWaitFlow);
   });
 
   afterAll(async () => {
@@ -438,7 +438,7 @@ describe('Scheduler spawn workflow', () => {
   let pool: Pool;
   let repo: PostgresJobRepo;
   let redis: Redis;
-  let scheduler: Scheduler;
+  let scheduler: SchedulerService;
 
   const dbConfig = {
     host: process.env.PGHOST!,
@@ -450,7 +450,7 @@ describe('Scheduler spawn workflow', () => {
   };
 
   // Child state machine: just sets output
-  const childSM = new StateMachine([
+  const childSM = new StateFlow([
     {
       name: 'start',
       onState: async ctx => {
@@ -462,7 +462,7 @@ describe('Scheduler spawn workflow', () => {
   ]);
 
   // Parent state machine: spawns a child
-  const parentSM = new StateMachine([
+  const parentSM = new StateFlow([
     {
       name: 'start',
       onState: async ctx => {
@@ -478,7 +478,7 @@ describe('Scheduler spawn workflow', () => {
   ]);
 
   // Parent with two children
-  const parentMultiSM = new StateMachine([
+  const parentMultiSM = new StateFlow([
     {
       name: 'start',
       onState: async ctx => {
@@ -503,10 +503,10 @@ describe('Scheduler spawn workflow', () => {
       password: process.env.REDIS_PASSWORD || undefined,
       db: 0,
     });
-    scheduler = new Scheduler(repo, redis);
-    scheduler.addStateMachine('parent', parentSM);
-    scheduler.addStateMachine('parentMulti', parentMultiSM);
-    scheduler.addStateMachine('child', childSM);
+    scheduler = new SchedulerService(repo, redis);
+    scheduler.addFlow('parent', parentSM);
+    scheduler.addFlow('parentMulti', parentMultiSM);
+    scheduler.addFlow('child', childSM);
   });
 
   afterAll(async () => {
@@ -534,7 +534,7 @@ describe('Scheduler spawn workflow', () => {
     const { rows } = await pool.query('SELECT * FROM jobs WHERE parent_id = $1', [parentId]);
     expect(rows.length).toBe(1);
     const childJob = rows[0];
-    expect(childJob.state_machine).toBe('child');
+    expect(childJob.flow).toBe('child');
     expect(childJob.status).toBe('pending');
   });
 
@@ -584,16 +584,16 @@ describe('Scheduler spawn workflow', () => {
 
   it('child failure marks parent waitFor as error', async () => {
     // Failing child state machine
-    const failChildSM = new StateMachine([
+    const failChildSM = new StateFlow([
       {
         name: 'start',
         onState: async () => { throw new Error('fail!'); },
         router: { next: null }
       }
     ]);
-    scheduler.addStateMachine('failChild', failChildSM);
+    scheduler.addFlow('failChild', failChildSM);
     // Parent that spawns a failChild
-    const parentFailSM = new StateMachine([
+    const parentFailSM = new StateFlow([
       {
         name: 'start',
         onState: async ctx => {
@@ -604,7 +604,7 @@ describe('Scheduler spawn workflow', () => {
       },
       { name: 'done', onState: async ctx => ctx }
     ]);
-    scheduler.addStateMachine('parentFail', parentFailSM);
+    scheduler.addFlow('parentFail', parentFailSM);
     const parentId = await scheduler.schedule('parentFail', { foo: 'parent' });
     await scheduler.runPendingJobs();
     // Get child job
@@ -630,7 +630,7 @@ describe('Scheduler orphaned job cleanup', () => {
   let pool: Pool;
   let repo: PostgresJobRepo;
   let redis: Redis;
-  let scheduler: Scheduler;
+  let scheduler: SchedulerService;
 
   const dbConfig = {
     host: process.env.PGHOST!,
@@ -651,8 +651,8 @@ describe('Scheduler orphaned job cleanup', () => {
       password: process.env.REDIS_PASSWORD || undefined,
       db: 0,
     });
-    scheduler = new Scheduler(repo, redis, { maxRetries: 0 });
-    scheduler.addStateMachine('test', testStateMachine);
+    scheduler = new SchedulerService(repo, redis, { maxRetries: 0 });
+    scheduler.addFlow('test', testFlow);
   });
 
   afterAll(async () => {
@@ -674,7 +674,7 @@ describe('Scheduler orphaned job cleanup', () => {
     // Insert a job with an old updated_at
     const oldJobId = '00000000-0000-0000-0000-000000000001';
     await pool.query(
-      `INSERT INTO jobs (id, state_machine, status, context, created_at, updated_at)
+      `INSERT INTO jobs (id, flow, status, context, created_at, updated_at)
        VALUES ($1, 'test', 'pending', '{}', NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours') RETURNING *`,
       [oldJobId]
     );
@@ -687,7 +687,7 @@ describe('Scheduler orphaned job cleanup', () => {
   it('should mark old running jobs as failed', async () => {
     const oldJobId = '00000000-0000-0000-0000-000000000002';
     await pool.query(
-      `INSERT INTO jobs (id, state_machine, status, context, created_at, updated_at)
+      `INSERT INTO jobs (id, flow, status, context, created_at, updated_at)
        VALUES ($1, 'test', 'running', '{}', NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours')`,
       [oldJobId]
     );
@@ -702,7 +702,7 @@ describe('Scheduler orphaned job cleanup', () => {
     const now = new Date();
     const future = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2 hours in the future
     await pool.query(
-      `INSERT INTO jobs (id, state_machine, status, context, created_at, updated_at)
+      `INSERT INTO jobs (id, flow, status, context, created_at, updated_at)
        VALUES ($1, 'test', 'pending', '{}', $2, $3)`,
       [recentJobId, now, future]
     );
@@ -735,7 +735,7 @@ describe('Scheduler escalations', () => {
   let repo: PostgresJobRepo;
   let escalationRepo: PostgresEscalationRepo;
   let redis: Redis;
-  let scheduler: Scheduler;
+  let scheduler: SchedulerService;
 
   const dbConfig = {
     host: process.env.PGHOST!,
@@ -757,7 +757,7 @@ describe('Scheduler escalations', () => {
       password: process.env.REDIS_PASSWORD || undefined,
       db: 0,
     });
-    scheduler = new Scheduler(repo, redis, { maxRetries: 0 }, escalationRepo);
+    scheduler = new SchedulerService(repo, redis, { maxRetries: 0 }, escalationRepo);
   });
 
   afterAll(async () => {
@@ -778,7 +778,7 @@ describe('Scheduler escalations', () => {
 
   it('should create and list an escalation', async () => {
     // State machine that triggers an escalation
-    const escalateSM = new StateMachine([
+    const escalateSM = new StateFlow([
       {
         name: 'start',
         onState: async ctx => {
@@ -791,7 +791,7 @@ describe('Scheduler escalations', () => {
         router: { next: null }
       }
     ]);
-    scheduler.addStateMachine('escalate', escalateSM);
+    scheduler.addFlow('escalate', escalateSM);
     const jobId = await scheduler.schedule('escalate', {});
     await scheduler.runPendingJobs();
     // There should be a pending escalation in the DB
@@ -802,7 +802,7 @@ describe('Scheduler escalations', () => {
   });
 
   it('should approve an escalation and unblock the job', async () => {
-    const escalateSM = new StateMachine([
+    const escalateSM = new StateFlow([
       {
         name: 'start',
         onState: async ctx => {
@@ -815,7 +815,7 @@ describe('Scheduler escalations', () => {
       },
       { name: 'done', onState: async ctx => ctx }
     ]);
-    scheduler.addStateMachine('escalate2', escalateSM);
+    scheduler.addFlow('escalate2', escalateSM);
     const jobId = await scheduler.schedule('escalate2', {});
     await scheduler.runPendingJobs();
     const escalations = await escalationRepo.listPendingEscalations();
@@ -834,7 +834,7 @@ describe('Scheduler escalations', () => {
   });
 
   it('should reject an escalation and mark wait as error', async () => {
-    const escalateSM = new StateMachine([
+    const escalateSM = new StateFlow([
       {
         name: 'start',
         onState: async ctx => {
@@ -847,7 +847,7 @@ describe('Scheduler escalations', () => {
       },
       { name: 'done', onState: async ctx => ctx }
     ]);
-    scheduler.addStateMachine('escalate3', escalateSM);
+    scheduler.addFlow('escalate3', escalateSM);
     const jobId = await scheduler.schedule('escalate3', {});
     await scheduler.runPendingJobs();
     const escalations = await escalationRepo.listPendingEscalations();

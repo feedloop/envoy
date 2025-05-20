@@ -1,37 +1,37 @@
 import { Json } from "../types";
 import { StateNode } from "./StateNode";
 import { StateObject } from "./StateObject";
-import { StateMachinePlugin, StateContext, StateDescriptor } from "./types";
+import { StateFlowPlugin as StateFlowPlugin, StateContext, StateDescriptor } from "./types";
 import { v4 as uuidv4 } from 'uuid';
 
 
-export type StateMachineOptions = {
+export type StateFlowOptions = {
     startState?: string;
-    plugins?: StateMachinePlugin[];
+    plugins?: StateFlowPlugin[];
     maxSteps?: number;
 }
 
-export class StateMachine<T extends StateContext = StateContext> {
+export class StateFlow<T extends StateContext = StateContext> {
 
     private _startState: string = "start";
     private _maxSteps: number = 25;
-    private _plugins: StateMachinePlugin[] = [];
+    private _plugins: StateFlowPlugin[] = [];
     private _nodes: StateNode[] = [];
 
-    constructor(_states: StateDescriptor[] = [], options: StateMachineOptions = {}) {
+    constructor(_states: StateDescriptor[] = [], options: StateFlowOptions = {}) {
         this._nodes = _states.map(state => new StateNode(this, state));
         this._maxSteps = options.maxSteps || 25;
         this._startState = options.startState || "start";
         // Dependency resolution for plugins
         const plugins = options.plugins || [];
-        this._plugins = StateMachine.resolvePluginDependencies(plugins);
+        this._plugins = StateFlow.resolvePluginDependencies(plugins);
     }
 
-    public static resolvePluginDependencies(plugins: StateMachinePlugin[]): StateMachinePlugin[] {
-        const resolved: StateMachinePlugin[] = [];
+    public static resolvePluginDependencies(plugins: StateFlowPlugin[]): StateFlowPlugin[] {
+        const resolved: StateFlowPlugin[] = [];
         const pluginMap = new Map(plugins.map(p => [p.name, p]));
         const visited = new Set<string>();
-        function visit(plugin: StateMachinePlugin, stack: string[] = []) {
+        function visit(plugin: StateFlowPlugin, stack: string[] = []) {
             if (resolved.includes(plugin)) return;
             if (visited.has(plugin.name)) return;
             visited.add(plugin.name);
@@ -79,15 +79,15 @@ export class StateMachine<T extends StateContext = StateContext> {
         return node;
     }
 
-    public plugins(): StateMachinePlugin[] {
+    public plugins(): StateFlowPlugin[] {
         return this._plugins;
     }
 
-    public plugin(name: string): StateMachinePlugin | null {
+    public plugin(name: string): StateFlowPlugin | null {
         return this._plugins.find(plugin => plugin.name === name) || null;
     }
 
-    public addPlugin(plugin: StateMachinePlugin): void {
+    public addPlugin(plugin: StateFlowPlugin): void {
         // Only add if dependencies are met
         if (plugin.dependsOn) {
             for (const dep of plugin.dependsOn) {
@@ -135,14 +135,14 @@ export class StateMachine<T extends StateContext = StateContext> {
         }
 
         let next = await node.route(ctx);
-        // Debug: print next state result
         
         let newCtx = ctx.clone();
 
         if (next) {
-            newCtx.setInput(next.input ?? null);
+            let output = await node.mapOutput(ctx, next);
+            newCtx.setInput(output);
             newCtx.clearOutput();
-            newCtx.setState(next.state);
+            newCtx.setState(next);
             newCtx.setStep(ctx.step() + 1);
             newCtx.resetExecState();
         } else {

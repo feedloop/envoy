@@ -1,5 +1,5 @@
-import { StateMachine } from '../core/StateMachine';
-import { RouteResult, StateContext, StateDescriptor } from '../core/types';
+import { StateFlow } from '../core/StateFlow';
+import { StateContext, StateDescriptor } from '../core/types';
 import { StateNode } from '../core/StateNode';
 import { AgentOptions, AgentTool, AgentToolResult, AgentPlanResult } from './types';
 import { LlmError, LlmMessage, LlmProvider, LlmResponse } from '../llm/types';
@@ -10,7 +10,7 @@ function harmonizeSpacing(str: string): string {
     return str.replace(new RegExp(`^${baselineSpacing}`, 'gm'), '');
 }
 
-export class ToolAgent extends StateMachine {
+export class ToolAgent extends StateFlow {
     private _tools: AgentTool[];
     public readonly maxRetry: number;
     public readonly provider: LlmProvider;
@@ -101,8 +101,14 @@ export class ToolAgent extends StateMachine {
                 },
                 router: {
                     routes: {
-                        ToolCall: { description: 'Call tools' },
-                        Finish: { description: 'Done' }
+                        ToolCall: {
+                            description: 'Call tools',
+                            map: (o) => ({messages: o.messages, result: o.result.data})
+                        },
+                        Finish: {
+                            description: 'Done',
+                            map: (o) => o.result.data.answer
+                        }
                     },
                     onRoute: async (ctx: StateContext) => {
                         let output = ctx.output<{ messages: LlmMessage[], result: LlmResponse }>();
@@ -111,13 +117,13 @@ export class ToolAgent extends StateMachine {
                             if (result.data) {
                                 let data = result.data as AgentPlanResult;
                                 if (data.toolCalls) {
-                                    return { state: 'ToolCall', input: {messages, result: data} };
+                                    return 'ToolCall';
                                 } else if (data.answer) {
-                                    return { state: 'Finish', input: data.answer };
+                                    return 'Finish';
                                 }
                             }
                         }
-                        return { state: 'Finish', input: null };
+                        return 'Finish';
                     }
                 }
             },

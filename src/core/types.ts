@@ -1,16 +1,11 @@
-import { Json, JsonObject } from "../types";
+import { Json, JsonObject, JsonSchema } from "../types";
 
-export type StateMachinePlugin = {
+export type StateFlowPlugin = {
     name: string;
     dependsOn?: string[];
     onEnter?: (state: StateContext) => Promise<StateContext>;
     onExit?: (state: StateContext) => Promise<StateContext>;
-    onRoute?: (ctx: StateContext, proposedNext: RouteResult | null) => Promise<RouteResult | null>;
-}
-
-export type RouteResult = {
-    state: string;
-    input: Json;
+    onRoute?: (ctx: StateContext, proposedNext:string | null) => Promise<string | null>;
 }
 
 export type EscalationInput = SelectInput | CommentInput | ApproveInput;
@@ -38,23 +33,25 @@ type ApproveInput = {
 
 
 
-export type StateDescriptor<T extends StateContext = StateContext> = {
+export type StateDescriptor = {
     name: string;
     router?: StateRouter;
-    onEnter?: (ctx: T) => Promise<T>;
-    onWaiting?: (ctx: T) => Promise<T>;
-    onExit?: (ctx: T) => Promise<T>;
-    onState: (ctx: T) => Promise<T>;
+    inputType?: JsonSchema;
+    outputType?: JsonSchema;
+    onEnter?: (ctx: StateContext) => Promise<StateContext>;
+    onExit?: (ctx: StateContext) => Promise<StateContext>;
+    onState: (ctx: StateContext) => Promise<StateContext>;
 }
 
-export type StateRouter = {next: string | null} | {
+export type StateRouter = {next: string | null, map?: (output: any, ctx: StateContext) => any} | {
     routes: {
-        [key: string]: {
+        [key: string]: ((output: any, ctx: StateContext) => any) | {
             description: string;
             default?: boolean;
+            map?: (output: any, ctx: StateContext) => any;
         }
     }
-    onRoute: (ctx: StateContext) => Promise<RouteResult | null>;
+    onRoute: (ctx: StateContext) => Promise<string | null>;
 }
 
 export type WaitFor = {

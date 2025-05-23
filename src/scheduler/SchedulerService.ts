@@ -4,7 +4,7 @@ import { Json } from "../types";
 import { Redis } from "ioredis";
 import { v4 as uuidv4 } from 'uuid';
 import { StateObject } from "../core/StateObject";
-import { EscalationInput, SerializedState } from "../core/types";
+import { EscalationInput, SerializedState, StateContext } from "../core/types";
 
 interface SchedulerOptions {
     concurrency?: number;
@@ -16,8 +16,9 @@ export class SchedulerService {
     private _workerId: string;
     private _concurrency: number;
     private _executionLoopTimer?: NodeJS.Timeout;
-    private _executionLoopActive: boolean = false;
+    private _reviewLoopTimer?: NodeJS.Timeout;
     private _cleanupTimer?: NodeJS.Timeout;
+    private _pendingJobsTimer?: NodeJS.Timeout;
     private _maxRetries: number;
     private _escalationRepo?: EscalationRepo;
 
@@ -52,6 +53,13 @@ export class SchedulerService {
             context: context.serialize(),
             retries: 0,
         });
+        
+        // Queue just this specific job, don't call runPendingJobs which would re-queue the same first 10 jobs
+        await Promise.all([
+            this._redis.set(`job:${job.id}`, JSON.stringify(job)),
+            this._redis.rpush('job_queue', job.id),
+        ]);
+        
         return job.id;
     }
 
@@ -60,98 +68,324 @@ export class SchedulerService {
     }
 
     /**
-     * Internal helper to handle moving a job to the blocking queue and updating status.
-     */
-    private async _handleBlockingJob(jobId: string, jobData: any, ctx: StateObject, queueNames: string[] = []) {
-        jobData.status = 'blocking';
-        jobData.context = ctx.serialize();
-        await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
-        // Remove from any provided queues
-        for (const queue of queueNames) {
-            await this._redis.lrem(queue, 0, jobId);
-        }
-        // Add to blocking_jobs queue if not already present
-        const inBlocking = (await this._redis.lrange('blocking_jobs', 0, -1)).includes(jobId);
-        if (!inBlocking) await this._redis.rpush('blocking_jobs', jobId);
-    }
-
-    /**
      * Polls for pending jobs, marks them as running, assigns workerId, and replicates to Redis.
      * @param limit Max number of jobs to process at once (default 10)
      */
     public async runPendingJobs(limit: number = 10): Promise<void> {
-        // 1. Fetch pending jobs
-        const pendingJobs = await this._jobRepo.getPendingJobs(limit);
-        for (const job of pendingJobs) {
-            // 2. Assign workerId in context
-            const context = Object.assign({}, job.context || {}, { workerId: this._workerId });
-            // 3. Mark as running in Postgres
-            const runningJob = await this._jobRepo.updateJob(job.id, {
-                status: 'running',
-                context,
-                startedAt: new Date(),
-            });
-            // 4. Replicate to Redis
-            await this._redis.sadd('running_jobs', job.id);
-            await this._redis.set(`job:${job.id}`, JSON.stringify({ ...runningJob, workerId: this._workerId }));
-            // 5. Add to global job queue
-            await this._redis.rpush('job_queue', job.id);
+        const jobs = await this._jobRepo.getPendingJobs(limit);
+        await Promise.all(jobs.map(async job => {
+            // Don't change status to running here - let doProcess claim it atomically
+            // Just queue the job if it's not already in Redis
+            const jobStr = await this._redis.get(`job:${job.id}`);
+            if (!jobStr) {
+                await Promise.all([
+                    this._redis.set(`job:${job.id}`, JSON.stringify(job)),
+                    this._redis.rpush('job_queue', job.id),
+                ]);
+            }
+        }));
+    }
 
-            // 6. Try to step the state machine and handle errors
+    public async doProcess(): Promise<void> {
+        // pop from job queue
+        const jobId = await this._redis.lpop('job_queue');
+        if (!jobId) return;
+        
+        try {
+            // get job and verify it's still processable
+            const job = await this._jobRepo.getJob(jobId);
+            
+            // Race condition protection: only process if job is pending or running (but not done/failed)
+            if (!['pending', 'running'].includes(job.status)) {
+                // Job already completed, failed, or cancelled by another worker
+                return;
+            }
+            
+            // If job is pending, atomically claim it by setting status to 'running'
+            let updatedJob = job;
+            if (job.status === 'pending') {
+                updatedJob = await this._jobRepo.updateJob(job.id, { 
+                    status: 'running',
+                    startedAt: new Date() 
+                });
+            }
+            // If job is already running, continue processing (might be a retry or continuation)
+            
+            // update job in Redis
+            await this._redis.set(`job:${updatedJob.id}`, JSON.stringify(updatedJob));
+            
+            // step the job
+            let newCtx: StateObject;
+            let sm = this.flow(job.flow);
             try {
-                const sm = this.flow(runningJob.flow);
-                let ctx = StateObject.from(runningJob.context as SerializedState);
-                ctx = await sm.step(ctx) as StateObject; // If this throws, catch below
-                // Handle spawn jobs
-                const waitingMap = ctx.getWaitingMap();
-                for (const waitId of ctx.isWaitingFor()) {
-                    const wait = waitingMap[waitId];
-                    if (wait.type === 'spawn' && wait.status === 'pending' && !wait.childJobId && wait.params && typeof wait.params.sm === 'string') {
-                        // Create child job
-                        const childJob = await this._jobRepo.createJob({
-                            flow: wait.params.sm,
-                            status: 'pending',
-                            context: this.flow(wait.params.sm).newContext(wait.params.input).serialize(),
-                            parent_id: job.id,
-                            retries: 0,
-                        });
-                        // Store mapping for easier resolution
-                        wait.childJobId = childJob.id;
-                    }
-                }
-                // --- NEW: Handle escalate waits ---
-                if (this._escalationRepo) {
-                    for (const waitId of ctx.isWaitingFor()) {
-                        const wait = waitingMap[waitId];
-                        if (wait.type === 'escalate' && wait.status === 'pending' && wait.params) {
-                            // Check if escalation already exists for this job+waitId
-                            const existing = await this._escalationRepo.listPendingEscalations();
-                            const alreadyExists = existing.some(e => e.job_id === job.id && e.wait_id === waitId);
-                            if (!alreadyExists) {
-                                await this._escalationRepo.createEscalation({
-                                    job_id: job.id,
-                                    wait_id: waitId,
-                                    user: wait.params.user as string,
-                                    message: wait.params.message as string,
-                                    inputs: wait.params.inputs as EscalationInput[]
-                                });
-                            }
-                        }
-                    }
-                }
-                // --- END NEW ---
-                // Save updated context if any child jobs were created
-                await this._jobRepo.updateJob(job.id, { context: ctx.serialize() });
-                // Handle blocking jobs
-                if (ctx.isWaitingFor && ctx.isWaitingFor().length > 0) {
-                    const jobStr = await this._redis.get(`job:${job.id}`);
-                    let jobData = jobStr ? JSON.parse(jobStr) : { ...runningJob };
-                    await this._handleBlockingJob(job.id, jobData, ctx, ['job_queue']);
-                }
-            } catch (err) {
-                await this.failJob(job.id, err instanceof Error ? err.message : String(err));
+                newCtx = await sm.step(StateObject.from(job.context));
+            } catch (error) {
+                newCtx = StateObject.from(job.context);
+                newCtx.error((error as Error)?.message ?? 'Unknown error');
+                await this.handleFailedJob(newCtx, updatedJob);
+                return;
+            }
+            
+            // Handle spawn requests
+            await this.handleSpawnRequests(newCtx, updatedJob);
+            // Handle escalation requests
+            await this.handleEscalationRequests(newCtx, updatedJob);
+            
+            // check if blocking
+            if (newCtx.isWaitingFor().length > 0) {
+                await this.handleBlockingJob(newCtx, updatedJob);
+            // check if done
+            } else if (newCtx.done() === "finished") {
+                await this.handleFinishedJob(newCtx, updatedJob);
+            // check if error
+            } else if (newCtx.done() === "error") {
+                await this.handleFailedJob(newCtx, updatedJob);
+            // check if cancelled
+            } else if (newCtx.done() === "cancelled") {
+                await this.handleCancelledJob(newCtx, updatedJob);
+            } else {
+                // job is still in progress - update context and put back in queue
+                await this._jobRepo.updateJob(updatedJob.id, { status: 'pending', context: newCtx.serialize() });
+                await this._redis.set(`job:${updatedJob.id}`, JSON.stringify({ ...updatedJob, status: 'pending', context: newCtx.serialize() }));
+                await this._redis.rpush('job_queue', jobId);
+            }
+        } catch (error) {
+            // Handle job not found or other errors gracefully
+            console.warn(`Failed to process job ${jobId}:`, error);
+            // Job might have been deleted or corrupted, skip it
+            return;
+        }
+    }
+
+    /**
+     * Handle spawn requests in the job context by creating child jobs
+     */
+    private async handleSpawnRequests(ctx: StateObject, parentJob: JobSchema): Promise<void> {
+        const waitingMap = ctx.getWaitingMap();
+        
+        // Get or initialize processed spawns list
+        const processedSpawns = ctx.get<string[]>('processedSpawns') || [];
+        let hasNewSpawns = false;
+        
+        for (const [waitId, waitingContext] of Object.entries(waitingMap)) {
+            if (waitingContext.type === 'spawn' && waitingContext.status === 'pending' && !processedSpawns.includes(waitId)) {
+                const spawnParams = waitingContext.params as { sm: string, input: any };
+                
+                // Create child job
+                const childJob = await this._jobRepo.createJob({
+                    flow: spawnParams.sm,
+                    status: 'pending',
+                    context: this.flow(spawnParams.sm).newContext(spawnParams.input).serialize(),
+                    parent_id: parentJob.id,
+                    retries: 0,
+                });
+                
+                // Update waiting context with child job ID
+                waitingContext.childJobId = childJob.id;
+                
+                // Queue this specific child job directly, don't call runPendingJobs which has a limit
+                await Promise.all([
+                    this._redis.set(`job:${childJob.id}`, JSON.stringify(childJob)),
+                    this._redis.rpush('job_queue', childJob.id),
+                ]);
+                
+                // Mark this spawn as processed
+                processedSpawns.push(waitId);
+                hasNewSpawns = true;
             }
         }
+        
+        // Update processed spawns list in context
+        if (hasNewSpawns) {
+            ctx.set('processedSpawns', processedSpawns);
+        }
+    }
+
+    /**
+     * Handle escalation requests in the job context by creating escalation records
+     */
+    private async handleEscalationRequests(ctx: StateObject, job: JobSchema): Promise<void> {
+        if (!this._escalationRepo) return;
+        const waitingMap = ctx.getWaitingMap();
+        // Get or initialize processed escalations list
+        const processedEscalations = ctx.get<string[]>("processedEscalations") || [];
+        let hasNewEscalations = false;
+        for (const [waitId, waitingContext] of Object.entries(waitingMap)) {
+            if (
+                waitingContext.type === "escalate" &&
+                waitingContext.status === "pending" &&
+                !processedEscalations.includes(waitId)
+            ) {
+                const params = waitingContext.params as { user: string; message: string; inputs: EscalationInput[] };
+                // Create escalation record
+                const escalation = await this._escalationRepo.createEscalation({
+                    job_id: job.id,
+                    wait_id: waitId,
+                    user: params.user,
+                    message: params.message,
+                    inputs: params.inputs,
+                });
+                // Set escalation metadata in context for workflow access (single escalation per state)
+                ctx.set(`$escalation`, {
+                    id: escalation.id,
+                    user: escalation.user,
+                    message: escalation.message,
+                    inputs: escalation.inputs,
+                    status: escalation.status,
+                });
+                processedEscalations.push(waitId);
+                hasNewEscalations = true;
+            }
+        }
+        if (hasNewEscalations) {
+            ctx.set("processedEscalations", processedEscalations);
+        }
+    }
+
+    public async handlePendingJob(ctx: StateObject, job: JobSchema): Promise<void> {
+        await Promise.all([
+            this._jobRepo.updateJob(job.id, { status: 'pending', context: ctx.serialize() }),
+            this._redis.del(`job:${job.id}`),
+            this._redis.lrem('blocking_jobs', 0, job.id),
+            this._redis.rpush('job_queue', job.id),
+        ]);
+    }
+
+    public async handleBlockingJob(ctx: StateObject, job: JobSchema): Promise<void> {
+        await Promise.all([
+            this._jobRepo.updateJob(job.id, { status: 'blocking', context: ctx.serialize() }),
+            this._redis.rpush('blocking_jobs', job.id),
+            this._redis.set(`job:${job.id}`, JSON.stringify({ ...job, status: 'blocking', context: ctx.serialize() })),
+        ]);
+    }
+
+    public async handleFinishedJob(ctx: StateObject, job: JobSchema, handleParent: boolean = true): Promise<void> {
+        ctx.setDone('finished');
+        // has parent?
+        if (job.parent_id && handleParent) {
+            // update waiting map
+            const parentJob = await this._jobRepo.getJob(job.parent_id);
+            const parentCtx = StateObject.from(parentJob.context as SerializedState);
+            const waitingMap = parentCtx.getWaitingMap();
+            let waitId = Object.keys(waitingMap)
+                .find(id => waitingMap[id].type === 'spawn' && waitingMap[id].childJobId === job.id);
+            if (waitId) {
+                const spawnEntry = waitingMap[waitId];
+                const spawnName = (spawnEntry.params as any)?.name || waitId;
+                
+                // Resolve in waiting map
+                parentCtx.resolve(waitId, 'success', ctx.output());
+                
+                // Also populate spawn data for easy access
+                parentCtx.set(`$spawn.${spawnName}.status`, 'success');
+                parentCtx.set(`$spawn.${spawnName}.result`, ctx.output() || null);
+                parentCtx.set(`$spawn.${spawnName}.error`, null);
+            }
+            await Promise.all([
+                this._jobRepo.updateJob(parentJob.id, { context: parentCtx.serialize() }),
+                this._redis.set(`job:${parentJob.id}`, JSON.stringify({ ...parentJob, context: parentCtx.serialize() })),
+            ]);
+        }
+        // update job in Postgres
+        await Promise.all([
+            this._jobRepo.updateJob(job.id, { status: 'done', finishedAt: new Date(), context: ctx.serialize() }),
+            this._redis.del(`job:${job.id}`),
+        ]);
+    }
+
+    public async handleFailedJob(ctx: StateObject, job: JobSchema, handleParent: boolean = true, handleChildren: boolean = true): Promise<void> {
+        // retry logic
+        if (job.retries < this._maxRetries) {
+            const updatedJob = await this._jobRepo.updateJob(job.id, { retries: job.retries + 1, status: 'pending' });
+            // Remove from Redis so it gets re-queued properly
+            await this._redis.del(`job:${job.id}`);
+            await this.runPendingJobs();
+        } else {
+            ctx.setDone('error');
+            
+            if (job.parent_id && handleParent) {
+                const parentJob = await this._jobRepo.getJob(job.parent_id);
+                const parentCtx = StateObject.from(parentJob.context as SerializedState);
+                const waitingMap = parentCtx.getWaitingMap();
+                const waitId = Object.keys(waitingMap)
+                    .find(id => waitingMap[id].type === 'spawn' && waitingMap[id].childJobId === job.id);
+                if (waitId) {
+                    const spawnEntry = waitingMap[waitId];
+                    const spawnName = (spawnEntry.params as any)?.name || waitId;
+                    
+                    // Resolve in waiting map
+                    parentCtx.resolve(waitId, 'error', ctx.error());
+                    
+                    // Also populate spawn data for easy access
+                    parentCtx.set(`$spawn.${spawnName}.status`, 'error');
+                    parentCtx.set(`$spawn.${spawnName}.result`, null);
+                    parentCtx.set(`$spawn.${spawnName}.error`, ctx.error() || 'Unknown error');
+                    
+                    // Update parent context and let it continue normally (no automatic failure)
+                    await Promise.all([
+                        this._jobRepo.updateJob(parentJob.id, { context: parentCtx.serialize() }),
+                        this._redis.set(`job:${parentJob.id}`, JSON.stringify({ ...parentJob, context: parentCtx.serialize() })),
+                    ]);
+                }
+            }
+            if (handleChildren) {
+                const childJobs = await this._jobRepo.getChildren(job.id);
+                await Promise.all(childJobs.map(async childJob => 
+                    this.handleCancelledJob(StateObject.from(childJob.context), childJob, false, true)));
+            }
+            // fail logic
+            await Promise.all([
+                this._jobRepo.setJobStatus(job.id, 'failed', ctx.error() ?? 'Unknown error'),
+                this._redis.del(`job:${job.id}`),
+                this._redis.lrem('job_queue', 0, job.id),
+            ]);
+        }
+    }
+
+    public async handleCancelledJob(ctx: StateObject, job: JobSchema, handleParent: boolean = true, handleChildren: boolean = true): Promise<void> {
+        ctx.setDone('cancelled');
+        
+        // Cancel child jobs when parent is cancelled
+        if (handleChildren) {
+            const childJobs = await this._jobRepo.getChildren(job.id);
+            await Promise.all(childJobs.map(async childJob => 
+                this.handleCancelledJob(StateObject.from(childJob.context), childJob, false, true)));
+        }
+        
+        // Handle parent when child is cancelled (but don't cancel the parent automatically)
+        if (job.parent_id && handleParent) {
+            const parentJob = await this._jobRepo.getJob(job.parent_id);
+            const parentCtx = StateObject.from(parentJob.context as SerializedState);
+            const waitingMap = parentCtx.getWaitingMap();
+            const waitId = Object.keys(waitingMap)
+                .find(id => waitingMap[id].type === 'spawn' && waitingMap[id].childJobId === job.id);
+            if (waitId) {
+                const spawnEntry = waitingMap[waitId];
+                const spawnName = (spawnEntry.params as any)?.name || waitId;
+                
+                // Resolve in waiting map with cancelled status
+                parentCtx.resolve(waitId, 'error', 'cancelled');
+                
+                // Also populate spawn data for easy access
+                parentCtx.set(`$spawn.${spawnName}.status`, 'cancelled');
+                parentCtx.set(`$spawn.${spawnName}.result`, null);
+                parentCtx.set(`$spawn.${spawnName}.error`, 'cancelled');
+                
+                // Update parent context and let it continue normally (no automatic cancellation)
+                await Promise.all([
+                    this._jobRepo.updateJob(parentJob.id, { context: parentCtx.serialize() }),
+                    this._redis.set(`job:${parentJob.id}`, JSON.stringify({ ...parentJob, context: parentCtx.serialize() })),
+                ]);
+            }
+        }
+        
+        // Update job status to cancelled
+        await Promise.all([
+            this._jobRepo.updateJob(job.id, { status: 'cancelled', context: ctx.serialize() }),
+            this._redis.del(`job:${job.id}`),
+            this._redis.lrem('job_queue', 0, job.id),
+            this._redis.lrem('blocking_jobs', 0, job.id), // Remove from blocking jobs too
+        ]);
     }
 
     /**
@@ -179,7 +413,8 @@ export class SchedulerService {
                 // fallback to DB
             }
         }
-        return this._jobRepo.getJob(jobId);
+        const job = await this._jobRepo.getJob(jobId);
+        return job;
     }
 
     /**
@@ -199,200 +434,68 @@ export class SchedulerService {
         return job.status;
     }
 
-    /**
-     * Mark a job as completed, update Postgres and clean up Redis.
-     */
-    public async completeJob(jobId: string): Promise<void> {
-        // Child job completion logic for spawn
-        const job = await this._jobRepo.getJob(jobId);
-        if (job.parent_id) {
-            // 1. Load parent job and context
-            const parentJob = await this._jobRepo.getJob(job.parent_id);
-            const parentCtx = StateObject.from(parentJob.context as SerializedState);
-            const waitingMap = parentCtx.getWaitingMap();
-            // 2. Find the waitFor entry for this child
-            for (const waitId in waitingMap) {
-                const wait = waitingMap[waitId];
-                if (wait.type === 'spawn' && wait.childJobId === jobId) {
-                    // 3. Write result to output
-                    let childOutput: Json | null = null;
-                    try {
-                        childOutput = StateObject.from(job.context as SerializedState).output() ?? null;
-                    } catch { /* fallback to null */ }
-                    parentCtx.output(`jobs.${jobId}`, childOutput);
-                    // 4. Mark as resolved
-                    parentCtx.resolve(waitId, "success", childOutput);
-                }
+    public async reviewBlockingJobs(): Promise<void> {
+        const blockingJobIds = await this._redis.lrange('blocking_jobs', 0, -1);
+        for (const jobId of blockingJobIds) {
+            const job = await this.getJob(jobId);
+            const ctx = StateObject.from(job.context as SerializedState);
+            if (ctx.isWaitingFor().length === 0) {
+                await this.handlePendingJob(ctx, job);
             }
-            // 5. Save updated parent context
-            await this._jobRepo.updateJob(parentJob.id, { context: parentCtx.serialize() });
-            // 6. If all waitFor resolved, requeue parent
-            if (parentCtx.isWaitingFor().length === 0) {
-                await this._jobRepo.updateJob(parentJob.id, { status: 'pending', context: parentCtx.serialize() });
-                await this._redis.rpush('job_queue', parentJob.id);
-                // Immediately process the parent job
-                await this.runPendingJobs();
-            }
-        }
-        // Existing completion logic
-        const status = await this.getJobStatus(jobId);
-        if (!['failed', 'cancelled', 'done'].includes(status)) {
-            await this._jobRepo.setJobStatus(jobId, 'done');
-        }
-        await this._redis.srem('running_jobs', jobId);
-        await this._redis.del(`job:${jobId}`);
-        await this._redis.lrem('job_queue', 0, jobId);
-    }
-
-    /**
-     * Mark a job as failed, update Postgres and clean up Redis.
-     * If retries < maxRetries, increment retries and requeue as pending.
-     */
-    public async failJob(jobId: string, error?: string): Promise<void> {
-        const job = await this._jobRepo.getJob(jobId);
-        if (job.parent_id) {
-            // 1. Load parent job and context
-            const parentJob = await this._jobRepo.getJob(job.parent_id);
-            const parentCtx = StateObject.from(parentJob.context as SerializedState);
-            const waitingMap = parentCtx.getWaitingMap();
-            // 2. Find the waitFor entry for this child
-            for (const waitId in waitingMap) {
-                const wait = waitingMap[waitId];
-                if (wait.type === 'spawn' && wait.childJobId === jobId) {
-                    // 3. Mark as error
-                    parentCtx.resolve(waitId, "error", error ?? "Child job failed");
-                }
-            }
-            // 4. Save updated parent context
-            await this._jobRepo.updateJob(parentJob.id, { context: parentCtx.serialize() });
-            // 5. If all waitFor resolved, requeue parent
-            if (parentCtx.isWaitingFor().length === 0) {
-                await this._jobRepo.updateJob(parentJob.id, { status: 'pending', context: parentCtx.serialize() });
-                await this._redis.rpush('job_queue', parentJob.id);
-                // Immediately process the parent job
-                await this.runPendingJobs();
-            }
-        }
-        // Retry logic
-        if (job.retries < this._maxRetries) {
-            await this._jobRepo.updateJob(jobId, { retries: job.retries + 1, status: 'pending' });
-            await this._redis.rpush('job_queue', jobId);
-        } else {
-            // Existing fail logic
-            await this._jobRepo.setJobStatus(jobId, 'failed', error);
-            await this._redis.srem('running_jobs', jobId);
-            await this._redis.del(`job:${jobId}`);
-            await this._redis.lrem('job_queue', 0, jobId);
         }
     }
 
-    /**
-     * Mark a job as cancelled, update Postgres and clean up Redis.
-     */
-    public async cancelJob(jobId: string): Promise<void> {
-        // Set status to 'cancelled' in Redis job object if it exists
-        const jobStr = await this._redis.get(`job:${jobId}`);
-        if (jobStr) {
-            try {
-                const jobData = JSON.parse(jobStr);
-                jobData.status = 'cancelled';
-                await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
-            } catch {}
-        }
-        await this._jobRepo.setJobStatus(jobId, 'cancelled');
-        await this._redis.srem('running_jobs', jobId);
-        await this._redis.del(`job:${jobId}`);
-        await this._redis.lrem('job_queue', 0, jobId);
-    }
 
     /**
      * Starts the distributed execution loop for running jobs.
      * @param intervalMs Polling interval in milliseconds (default 1000)
-     * @param lockTtlMs Lock TTL in milliseconds (default 10000)
      */
-    public startExecutionLoop(intervalMs: number = 1000, lockTtlMs: number = 10000): void {
-        const workerQueue = `worker:${this._workerId}:queue`;
-        let activeJobs = 0;
-        this._executionLoopActive = true;
-        const processJob = async (jobId: string) => {
-            const lockKey = `job:${jobId}:lock`;
-            const lockVal = this._workerId;
-            // Try to acquire lock
-            const acquired = await this._redis.set(lockKey, lockVal, 'PX', lockTtlMs, 'NX');
-            if (!acquired) {
-                // If lock not acquired, requeue and try next
-                await this._redis.rpush(workerQueue, jobId);
-                return;
-            }
-            try {
-                // Load context from Redis
-                const jobStr = await this._redis.get(`job:${jobId}`);
-                if (!jobStr) return;
-                let jobData;
-                try { jobData = JSON.parse(jobStr); } catch { return; }
-                // Check for cancellation at top level
-                if (jobData.status === 'cancelled') {
-                    await this.cancelJob(jobId);
-                    return;
-                }
-                let ctx = StateObject.from(jobData.context);
-                // Step the state machine
-                const sm = this.flow(jobData.flow);
-                const newCtx = await sm.step(ctx);
-                // Update context in Redis
-                jobData.context = newCtx.serialize();
-                // If job is done, clean up
-                if (newCtx.done()) {
-                    await this.completeJob(jobId);
-                } else if (newCtx.error) {
-                    await this.failJob(jobId, newCtx.error);
-                } else if (newCtx.isWaitingFor && newCtx.isWaitingFor().length > 0) {
-                    await this._handleBlockingJob(jobId, jobData, newCtx as StateObject, [workerQueue, 'job_queue']);
-                } else {
-                    await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
-                    // Requeue job for next step
-                    await this._redis.rpush(workerQueue, jobId);
-                }
-                // Async sync to Postgres (non-blocking)
-                setTimeout(() => {
-                    this._jobRepo.updateJob(jobId, {
-                        context: jobData.context,
-                        status: newCtx.done() ? 'done' : jobData.status,
-                        error: newCtx.error || undefined,
-                    }).catch(() => {});
-                }, 0);
-            } finally {
-                await this._redis.del(lockKey);
-                activeJobs--;
-            }
+    public start(intervalMs: number = 0): void {
+        // Clear any existing timers first to prevent duplicates
+        this.stop();
+        
+        // use setTimeouts to avoid race conditions
+        let executionLoop = async () => {
+            await this.doProcess();
+            this._executionLoopTimer = setTimeout(executionLoop, intervalMs);
         };
-        const loop = async () => {
-            if (!this._executionLoopActive) return;
-            try {
-                // Fill worker queue up to concurrency
-                while (activeJobs < this._concurrency) {
-                    // Atomically move job from global queue to worker queue
-                    const jobId = await this._redis.rpoplpush('job_queue', workerQueue);
-                    if (!jobId) break;
-                    activeJobs++;
-                    processJob(jobId).then(() => setTimeout(loop, 0));
-                }
-            } catch (err) {
-                // Optionally log error
-            } finally {
-                this._executionLoopTimer = setTimeout(loop, intervalMs);
-            }
+        let reviewLoop = async () => {
+            await this.reviewBlockingJobs();
+            this._reviewLoopTimer = setTimeout(reviewLoop, intervalMs);
         };
-        loop();
+        let cleanupLoop = async () => {
+            await this.cleanupOrphanedJobs();
+            this._cleanupTimer = setTimeout(cleanupLoop, intervalMs * 10);
+        };
+        let pendingJobsLoop = async () => {
+            await this.runPendingJobs();
+            this._pendingJobsTimer = setTimeout(pendingJobsLoop, intervalMs * 2);
+        };
+        this._executionLoopTimer = setTimeout(executionLoop, 0);
+        this._reviewLoopTimer = setTimeout(reviewLoop, intervalMs);
+        this._cleanupTimer = setTimeout(cleanupLoop, intervalMs * 10);
+        this._pendingJobsTimer = setTimeout(pendingJobsLoop, intervalMs * 2);
     }
 
     /**
      * Stops the distributed execution loop.
      */
-    public stopExecutionLoop(): void {
-        this._executionLoopActive = false;
+    public stop(): void {
         if (this._executionLoopTimer) {
             clearTimeout(this._executionLoopTimer);
+            this._executionLoopTimer = undefined;
+        }
+        if (this._reviewLoopTimer) {
+            clearTimeout(this._reviewLoopTimer);
+            this._reviewLoopTimer = undefined;
+        }
+        if (this._cleanupTimer) {
+            clearTimeout(this._cleanupTimer);
+            this._cleanupTimer = undefined;
+        }
+        if (this._pendingJobsTimer) {
+            clearTimeout(this._pendingJobsTimer);
+            this._pendingJobsTimer = undefined;
         }
     }
 
@@ -414,75 +517,14 @@ export class SchedulerService {
     }
 
     /**
-     * Resolve a specific waitFor on a blocking job. If no more waits, move back to main queue and set status to 'pending'.
-     * Updates Redis immediately, Postgres asynchronously.
-     */
-    public async resolveBlockingJob(jobId: string, waitForId: string, output?: Json): Promise<void> {
-        const job = await this.getJob(jobId);
-        const ctx = StateObject.from(job.context as SerializedState);
-        ctx.resolve(waitForId, 'success', output);
-        const stillBlocking = ctx.isWaitingFor().length > 0;
-        // Update context and status in Redis
-        const jobStr = await this._redis.get(`job:${jobId}`);
-        let jobData = jobStr ? JSON.parse(jobStr) : { ...job };
-        jobData.context = ctx.serialize();
-        if (stillBlocking) {
-            jobData.status = 'blocking';
-            await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
-            // Ensure in blocking_jobs queue
-            const inQueue = (await this._redis.lrange('blocking_jobs', 0, -1)).includes(jobId);
-            if (!inQueue) await this._redis.rpush('blocking_jobs', jobId);
-        } else {
-            jobData.status = 'pending';
-            await this._redis.set(`job:${jobId}`, JSON.stringify(jobData));
-            // Remove from blocking_jobs queue
-            await this._redis.lrem('blocking_jobs', 0, jobId);
-            // Add back to main job queue
-            await this._redis.rpush('job_queue', jobId);
-        }
-        // Async update to Postgres
-        setTimeout(() => {
-            this._jobRepo.updateJob(jobId, {
-                context: jobData.context,
-                status: jobData.status,
-            }).catch(() => {});
-        }, 0);
-    }
-
-    /**
      * Scans for jobs stuck in 'pending' or 'running' for too long and marks them as failed.
      * @param maxAgeMs Maximum allowed age in milliseconds (default: 1 hour)
      */
     public async cleanupOrphanedJobs(maxAgeMs: number = 60 * 60 * 1000): Promise<void> {
         const jobs = await this._jobRepo.getStuckJobs(['pending', 'running'], maxAgeMs);
-        for (const job of jobs) {
-            await this.failJob(job.id, 'Orphaned job: exceeded max allowed age');
-            console.warn(`Orphaned job ${job.id} marked as failed.`);
-        }
-    }
-
-    /**
-     * Starts the execution loop and schedules periodic orphaned job cleanup.
-     * @param intervalMs Polling interval for execution loop (default 1000)
-     * @param cleanupIntervalMs How often to run orphaned job cleanup (default 1 hour)
-     * @param orphanMaxAgeMs Max age for a job to be considered orphaned (default 1 hour)
-     */
-    public start(intervalMs: number = 1000, cleanupIntervalMs: number = 60 * 60 * 1000, orphanMaxAgeMs: number = 60 * 60 * 1000): void {
-        this.startExecutionLoop(intervalMs);
-        this._cleanupTimer = setInterval(() => {
-            this.cleanupOrphanedJobs(orphanMaxAgeMs).catch(console.error);
-        }, cleanupIntervalMs);
-    }
-
-    /**
-     * Stops the execution loop and orphaned job cleanup.
-     */
-    public stop(): void {
-        this.stopExecutionLoop();
-        if (this._cleanupTimer) {
-            clearInterval(this._cleanupTimer);
-            this._cleanupTimer = undefined;
-        }
+        await Promise.all(jobs.map(async job => {
+            await this.handleFailedJob(StateObject.from(job.context), job, false, false);
+        }));
     }
 
     /**
@@ -500,7 +542,11 @@ export class SchedulerService {
         const ctx = StateObject.from(job.context as SerializedState);
         // 3. Resolve the escalation in the waiting map using wait_id
         ctx.resolve(escalation.wait_id, status === 'approved' ? 'success' : 'error', values);
-        // 4. Save updated context and update job status accordingly
+        // 4. Also populate escalation response data in ephemeral storage for easy access
+        for (const [key, value] of Object.entries(values)) {
+            ctx.set(`$escalation.${key}`, value);
+        }
+        // 5. Save updated context and update job status accordingly
         const stillBlocking = ctx.isWaitingFor().length > 0;
         let newStatus: JobStatus;
         if (stillBlocking) {
@@ -525,5 +571,11 @@ export class SchedulerService {
             await this._redis.lrem('blocking_jobs', 0, job.id);
             await this._redis.rpush('job_queue', job.id);
         }
+    }
+
+    public async cancel(jobId: string): Promise<void> {
+        const job = await this._jobRepo.getJob(jobId);
+        const ctx = StateObject.from(job.context as SerializedState);
+        await this.handleCancelledJob(ctx, job, true, true);
     }
 }

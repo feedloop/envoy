@@ -24,6 +24,7 @@ export interface JobRepo {
     getPendingJobs(limit?: number): Promise<JobSchema[]>;
     setJobStatus(id: string, status: JobStatus, error?: string): Promise<JobSchema>;
     getStuckJobs(statuses: string[], maxAgeMs: number): Promise<JobSchema[]>;
+    getChildren(id: string): Promise<JobSchema[]>;
 }
 
 export type EscalationStatus = 'pending' | 'approved' | 'rejected' | 'resolved';

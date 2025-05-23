@@ -11,7 +11,7 @@ export type StateFlowOptions = {
     maxSteps?: number;
 }
 
-export class StateFlow<T extends StateContext = StateContext> {
+export class StateFlow {
 
     private _startState: string = "start";
     private _maxSteps: number = 25;
@@ -99,7 +99,7 @@ export class StateFlow<T extends StateContext = StateContext> {
         this._plugins.push(plugin);
     }
 
-    public async step(_ctx: T): Promise<T> {
+    public async step(_ctx: StateObject): Promise<StateObject> {
         let ctx = _ctx as unknown as StateObject;
 
         let node = this.node(ctx.state());
@@ -114,24 +114,28 @@ export class StateFlow<T extends StateContext = StateContext> {
             ctx.cycleExecState();
         }
 
+        if (ctx.isWaitingFor("enter").length > 0) {
+            return ctx;
+        }
+
         // execute onState
         if (ctx.execState() === "state") {
             ctx = await node.onState(ctx) as StateObject;
             ctx.cycleExecState();
         }
 
-        if (ctx.isWaitingFor().length > 0) {
-            return ctx as unknown as T;
-        }
-        
-        if (ctx.execState() === "waiting" && ctx.isWaitingFor().length === 0) {
-            ctx.cycleExecState();
+        if (ctx.isWaitingFor("state").length > 0) {
+            return ctx;
         }
 
         // execute onExit
         if (ctx.execState() === "exit") {
             ctx = await node.onExit(ctx) as StateObject;
             ctx.cycleExecState();
+        }
+
+        if (ctx.isWaitingFor("exit").length > 0) {
+            return ctx;
         }
 
         let next = await node.route(ctx);
@@ -145,25 +149,18 @@ export class StateFlow<T extends StateContext = StateContext> {
             newCtx.setState(next);
             newCtx.setStep(ctx.step() + 1);
             newCtx.resetExecState();
+            newCtx.clearEphemeralData();
         } else {
             newCtx.setDone();
         }
 
         // Debug: print new context state
         
-        return newCtx as unknown as T;
+        return newCtx;
     }
 
-    public newContext(input: Json): T {
+    public newContext(input: Json): StateObject {
         let ctx = new StateObject(this._startState, 1, input);
-        return ctx as unknown as T;
-    }
-
-    public async run(input: Json): Promise<T> {
-        let ctx = await this.newContext(input);
-        while (!ctx.done()) {
-            ctx = await this.step(ctx);
-        }
         return ctx;
     }
 }

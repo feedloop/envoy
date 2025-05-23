@@ -24,6 +24,11 @@ export class PostgresJobRepo implements JobRepo {
         return this.rowToJob(res.rows[0]);
     }
 
+    public async getChildren(id: string): Promise<JobSchema[]> {
+        const res = await this.pool.query(`SELECT * FROM jobs WHERE parent_id = $1`, [id]);
+        return res.rows.map(this.rowToJob);
+    }
+
     public async updateJob(id: string, updates: Partial<JobSchema>): Promise<JobSchema> {
         // Build dynamic SET clause
         const fields = [];

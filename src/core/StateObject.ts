@@ -9,7 +9,7 @@ export class StateObject implements StateContext {
         [key: string]: WaitingContext
     }
     private _data: JsonObject;
-    private _execState: "enter" | "state" | "waiting" | "exit"| "finish" = "enter";
+    private _execState: "enter" | "state" | "exit"| "finish" = "enter";
     private _error: string | null = null;
 
     constructor(
@@ -29,8 +29,6 @@ export class StateObject implements StateContext {
         if (this._execState === "enter") {
             this._execState = "state";
         } else if (this._execState === "state") {
-            this._execState = "waiting";
-        } else if (this._execState === "waiting") {
             this._execState = "exit";
         } else if (this._execState === "exit") {
            this._execState = "finish";
@@ -57,9 +55,13 @@ export class StateObject implements StateContext {
         return this._step;
     }
 
-    public error(msg: string): void {
-        this._done = "error";
-        this._error = msg;
+    public error(msg?: string): string | null {
+        if (arguments.length > 0 && msg !== undefined) {
+            this._done = "error";
+            this._error = msg;
+        }
+
+        return this._error;
     }
 
     public setState(state: string): void {
@@ -115,14 +117,15 @@ export class StateObject implements StateContext {
                 id: item.id,
                 type: item.type,
                 status: "pending",
+                execState: this._execState,
                 params: item.params,
             }
         }
     }
 
-    public spawn(sm: string, input: Json): string {
+    public spawn(name: string, sm: string, input: Json): string {
         let id = `spawn-${sm}-${uuidv4().substring(0, 3)}`;
-        this.waitFor([{ id: id, type: 'spawn', params: { sm, input } }]);
+        this.waitFor([{ id: id, type: 'spawn', params: { sm, input, name } }]);
         return id;
     }
 
@@ -132,10 +135,10 @@ export class StateObject implements StateContext {
         return id;
     }
 
-    public isWaitingFor(): string[] {
+    public isWaitingFor(execState?: "enter" | "state" | "exit" | "finish"): string[] {
         let list: string[] = [];
         for (let id in this._waiting) {
-            if (this._waiting[id].status === "pending") {
+            if (this._waiting[id].status === "pending" && (this._waiting[id].execState === execState || execState === undefined)) {
                 list.push(id);
             }
         }
@@ -152,6 +155,7 @@ export class StateObject implements StateContext {
                 id: id,
                 type: waiting.type,
                 status: "success",
+                execState: waiting.execState,
                 output: outputOrError,
             }
         } else {
@@ -159,17 +163,42 @@ export class StateObject implements StateContext {
                 id: id,
                 type: waiting.type,
                 status: "error",
+                execState: waiting.execState,
                 error: outputOrError,
             }
         }
     }
 
     public set<T extends Json>(key: string, value: T): void {
-        this._data[key] = value;
+        if (key.includes('.')) {
+            const path = key.split('.');
+            let obj = this._data as any;
+            for (let i = 0; i < path.length - 1; i++) {
+                if (typeof obj[path[i]] !== 'object' || obj[path[i]] === null) {
+                    obj[path[i]] = {};
+                }
+                obj = obj[path[i]];
+            }
+            obj[path[path.length - 1]] = value;
+        } else {
+            this._data[key] = value;
+        }
     }
 
     public get<T extends Json>(key: string): T {
-        return this._data[key] as T;
+        if (key.includes('.')) {
+            const path = key.split('.');
+            let obj = this._data as any;
+            for (const segment of path) {
+                if (obj === null || obj === undefined || typeof obj !== 'object') {
+                    return undefined as unknown as T;
+                }
+                obj = obj[segment];
+            }
+            return obj as T;
+        } else {
+            return this._data[key] as T;
+        }
     }
 
     public clone(newId = false): StateObject {
@@ -210,5 +239,12 @@ export class StateObject implements StateContext {
 
     public getWaitingMap(): { [key: string]: WaitingContext } {
         return this._waiting;
+    }
+
+    public clearEphemeralData(): void {
+        const keysToDelete = Object.keys(this._data).filter(key => key.startsWith('$'));
+        for (const key of keysToDelete) {
+            delete this._data[key];
+        }
     }
 }

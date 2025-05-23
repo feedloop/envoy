@@ -62,6 +62,7 @@ export type WaitFor = {
 
 export type WaitingContext = WaitFor & {
     status: "pending" | "success" | "error";
+    execState: "enter" | "state" | "exit" | "finish";
     output?: Json;
     error?: Json;
     childJobId?: string;
@@ -77,7 +78,7 @@ export type StateContext = {
     output<T extends Json>(path: string, value: T): void;
     waitFor(waitlist: WaitFor[]): void;
     isWaitingFor(): string[];
-    spawn(sm: string, input: Json): string;
+    spawn(name: string, sm: string, input: Json): string;
     escalate(user: string, message: string, inputs: EscalationInput[]): string;
     set<T extends Json>(key: string, value: T): void;
     get<T extends Json>(key: string): T;
@@ -91,7 +92,7 @@ export type SerializedState = {
     step: number;
     input: Json;
     output: Json | null;
-    execState: "enter" | "state" | "waiting" | "exit" | "finish";
+    execState: "enter" | "state" | "exit" | "finish";
     done: "finished" | "error" | "cancelled" | "maxSteps" | null;
     waiting: {
         [key: string]: WaitingContext
